@@ -1,0 +1,36 @@
+{
+  "os":  "Windows-10-10.0.19045-SP0",
+  "python":  "CPython 3.12.6",
+  "startedAt":  "2026-05-11T10:54:06.933413Z",
+  "program":  "c:\\Users\\Dongha Lee\\Desktop\\HFSP_Quality\\train_asil.py",
+  "codePath":  "train_asil.py",
+  "codePathLocal":  "train_asil.py",
+  "email":  "max107304@gmail.com",
+  "root":  "C:\\Users\\Dongha Lee\\Desktop\\HFSP_Quality",
+  "host":  "DESKTOP-VDS44RT",
+  "executable":  "C:\\Users\\Dongha Lee\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+  "cpu_count":  8,
+  "cpu_count_logical":  8,
+  "gpu":  "NVIDIA GeForce RTX 3070 Ti",
+  "gpu_count":  1,
+  "disk":  {
+    "/":  {
+      "total":  "499534917632",
+      "used":  "441138458624"
+    }
+  },
+  "memory":  {
+    "total":  "34274660352"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce RTX 3070 Ti",
+      "memoryTotal":  "8589934592",
+      "cudaCores":  6144,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-c275236c-7a73-1e31-7b93-1dee69d90b8c"
+    }
+  ],
+  "cudaVersion":  "12.8",
+  "writerId":  "usvhtmp2odlm7dfko62n9c93zonsjyhg"
+}

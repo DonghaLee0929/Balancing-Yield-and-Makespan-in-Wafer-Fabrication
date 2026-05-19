@@ -1,0 +1,138 @@
+_wandb:
+    value:
+        cli_version: 0.26.1
+        e:
+            t8knrbzdn2fbfhd1xoq22tqto7eu6yq7:
+                args:
+                    - --epochs
+                    - "1"
+                    - --epoch_size
+                    - "50"
+                    - --batch_size
+                    - "50"
+                    - --pomo_size
+                    - "12"
+                    - --lambda_count
+                    - "5"
+                    - --num_jobs
+                    - "8"
+                    - --no_wandb
+                    - --eval_interval
+                    - "1"
+                    - --eval_batch_size
+                    - "16"
+                    - --ckpt
+                    - checkpoints/_smoke.pt
+                codePath: train_ASIL_with_quality.py
+                codePathLocal: train_ASIL_with_quality.py
+                cpu_count: 16
+                cpu_count_logical: 24
+                cudaVersion: "12.6"
+                disk:
+                    /:
+                        total: "499431501824"
+                        used: "361486381056"
+                email: max107304@gmail.com
+                executable: C:\Users\user\AppData\Local\Programs\Python\Python312\python.exe
+                gpu: NVIDIA GeForce RTX 3090
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 10496
+                      memoryTotal: "25769803776"
+                      name: NVIDIA GeForce RTX 3090
+                      uuid: GPU-8803da08-1a45-3ef4-49fd-4ad326b512fe
+                host: DESKTOP-CF8LO69
+                memory:
+                    total: "68479098880"
+                os: Windows-10-10.0.19045-SP0
+                program: C:\Users\user\Desktop\Dongha\HFSP_Quality\train_ASIL_with_quality.py
+                python: CPython 3.12.4
+                root: C:\Users\user\Desktop\Dongha\HFSP_Quality
+                startedAt: "2026-05-13T02:03:54.599921Z"
+                writerId: t8knrbzdn2fbfhd1xoq22tqto7eu6yq7
+        m: []
+        python_version: 3.12.4
+        t:
+            "1":
+                - 1
+                - 5
+                - 53
+            "2":
+                - 1
+                - 5
+                - 53
+            "3":
+                - 2
+                - 16
+                - 61
+            "4": 3.12.4
+            "5": 0.26.1
+            "8":
+                - 3
+            "12": 0.26.1
+            "13": windows-amd64
+B:
+    value: 50
+P:
+    value: 12
+embedding_dim:
+    value: 256
+encoder_layer_num:
+    value: 3
+epoch_size:
+    value: 50
+eval_type:
+    value: argmax
+ff_hidden_dim:
+    value: 512
+head_num:
+    value: 16
+logit_clipping:
+    value: 10
+lr:
+    value: 0.0001
+lr_gamma:
+    value: 0.1
+lr_milestones:
+    value:
+        - 80
+        - 90
+mB:
+    value: 50
+machines:
+    value:
+        - 5
+        - 3
+        - 7
+        - 3
+        - 5
+        - 7
+ms_hidden_dim:
+    value: 16
+ms_layer1_init:
+    value: 0.7071067811865476
+ms_layer2_init:
+    value: 0.25
+n_params:
+    value: 3562848
+num_epochs:
+    value: 1
+num_jobs:
+    value: 8
+num_ops:
+    value: 48
+qkv_dim:
+    value: 16
+seed:
+    value: 1
+sqrt_embedding_dim:
+    value: 16
+sqrt_qkv_dim:
+    value: 4
+time_high:
+    value: 7
+time_low:
+    value: 3
+weight_decay:
+    value: 1e-06
