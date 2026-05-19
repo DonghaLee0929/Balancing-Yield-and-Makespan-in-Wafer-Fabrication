@@ -5,7 +5,7 @@ front 를 시각화.
 
 - proc_time     : quality_data/P_{p_idx}.csv  (load_problems_from__quality_file)
 - wafer_quality : quality_data/Q_{q_idx}/historical_paths_{paths_idx}.csv  앞 num_jobs 행 (랜덤 X)
-- quality model : quality_results/Q_{q_idx}/paths_{paths_idx}/best_pipeline.pkl  (사전 학습)
+- quality model : quality_results/Q_{q_idx}/paths_{paths_idx}/best_hb_model.zip  (사전 학습, Hummingbird PyTorch)
 - samples_per_lambda == 1 → greedy decoding (PMOCO 류 표준 패턴)
 - samples_per_lambda  > 1 → 각 λ 에서 stochastic sampling
 
@@ -310,7 +310,7 @@ def evaluate_pareto(
 
     for r, paths_idx in enumerate(paths_idx_list):
         wq_csv     = f'quality_data/Q_{q_idx}/historical_paths_{paths_idx}.csv'
-        model_path = f'quality_results/Q_{q_idx}/paths_{paths_idx}/best_pipeline.pkl'
+        model_path = f'quality_results/Q_{q_idx}/paths_{paths_idx}/best_hb_model.zip'
         wafer_path = f'quality_results/Q_{q_idx}/paths_{paths_idx}/wafer_quality.json'
 
         quality_helper = QualityHelper(num_stages=env.num_stages,
@@ -427,7 +427,7 @@ if __name__ == "__main__":
     p.add_argument('--paths_idx',   type=str, default='1~10',
                    help="historical_paths 인덱스. 단일('5') / range('1~10') / list('1,3,5'). "
                         "여러 개면 각 idx 별 1회 실험 후 (makespan, yield) 평균으로 Pareto 그림. "
-                        "모델/풀 : quality_results/Q_{q_idx}/paths_{paths_idx}/{best_pipeline.pkl, wafer_quality.json}. "
+                        "모델/풀 : quality_results/Q_{q_idx}/paths_{paths_idx}/{best_hb_model.zip, wafer_quality.json}. "
                         "입력 CSV : quality_data/Q_{q_idx}/historical_paths_{paths_idx}.csv")
     p.add_argument('--single_view', type=str, default='all',
                    choices=['best', 'all'],

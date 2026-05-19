@@ -563,9 +563,12 @@ def eval_pareto(eval_env: HFSPGraphEnv, model: FFSPModel,
 
 
 def plot_pareto(ms: torch.Tensor, q: torch.Tensor, lambdas: torch.Tensor,
-                m_best: float, m_worst: float, q_best: float, q_worst: float,
-                save_path: str, title: str = ""):
+                save_path: str, title: str = "",
+                xlim: tuple = (100.0, 500.0),
+                ylim: tuple = (0.50, 0.85),
+                ref_point: tuple | None = None):
     # matplotlib boundary — 여기에서만 텐서를 numpy 로 내림. compute path 는 전부 torch.
+    # xlim/ylim/ref_point 는 시각화 전용 하드코딩 값 — HV/reward 정규화 anchor 와 무관.
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -587,11 +590,14 @@ def plot_pareto(ms: torch.Tensor, q: torch.Tensor, lambdas: torch.Tensor,
                     edgecolor='black', zorder=5, vmin=0, vmax=1)
     plt.colorbar(sc, ax=ax, label='λ')
 
-    ax.scatter([m_worst], [q_worst], marker='X', color='red', s=60, zorder=4,
-               clip_on=False, label=f'ref ({m_worst:.1f}, {q_worst:.3f})')
+    if ref_point is not None:
+        m_r, q_r = ref_point
+        ax.scatter([m_r], [q_r], marker='X', color='red', s=60, zorder=4,
+                   clip_on=False, label=f'ref ({m_r:.1f}, {q_r:.3f})')
+        ax.legend(loc='lower left', fontsize=8)
 
     ax.set_xlabel('Makespan ↓'); ax.set_ylabel('Yield ↑')
-    ax.set_xlim(m_best, m_worst); ax.set_ylim(q_worst, q_best)
-    ax.set_title(title); ax.legend(loc='lower left', fontsize=8)
+    ax.set_xlim(*xlim); ax.set_ylim(*ylim)
+    ax.set_title(title)
     ax.grid(alpha=0.3); fig.tight_layout()
     fig.savefig(save_path, dpi=100); plt.close(fig)

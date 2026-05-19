@@ -371,9 +371,14 @@ def train(num_epochs=100,
                         f"Δms={d_ms:+.2f} Δq={d_q:+.3f} nd={nd_mean:.1f}")
 
             scatter_path = f"train_results/pareto_epoch_{epoch}.png"
+            # === Pareto plot 시각화 axis 하드코딩 (hv_* anchor 와 독립) ===
+            # 필요시 여기 값만 수정하면 됨. ref_point=None 이면 빨간 X 마커 안 그림.
+            PLOT_XLIM = (100.0, 500.0)   # makespan (x) min, max
+            PLOT_YLIM = (0.50, 0.85)     # yield (y) min, max
+            PLOT_REF  = None             # 예: (500.0, 0.50) 로 ref 마커 표시
             plot_pareto(ms_lam, q_lam, pareto_lambdas,
-                        hv_m_best, hv_m_ref, hv_q_best, hv_q_ref,
-                        scatter_path, title=f"epoch {epoch}  HV={hv_mean:.3f}")
+                        scatter_path, title=f"epoch {epoch}  HV={hv_mean:.3f}",
+                        xlim=PLOT_XLIM, ylim=PLOT_YLIM, ref_point=PLOT_REF)
             rec.log_pareto(hv_mean, hv_std, ep_ms, ep_q,
                            nd_mean, scatter_path,
                            d_ms=d_ms, d_q=d_q)
@@ -396,7 +401,7 @@ def train(num_epochs=100,
 
             eval_elapsed = time.time() - t_eval_start
             total_eval_time += eval_elapsed
-            log_msg += f"  (eval {eval_elapsed:5.2f}s)"
+            log_msg += f" ({eval_elapsed:5.2f}s)"
             print(log_msg)
 
         rec.log_epoch(train_elapsed, cur_lr)
@@ -434,14 +439,14 @@ if __name__ == "__main__":
     p.add_argument('--pareto_lambdas', type=int, default=32,
                    help='Number of λ values for Pareto sweep (linspace(0,1,N)). '
                         'HV/scatter/endpoint 모두 이걸 사용.')
-    p.add_argument('--hv_m_best', type=float, default=100.0,
-                   help='Best (lowest) makespan anchor — reward 정규화 + Pareto plot x-min.')
+    p.add_argument('--hv_m_best', type=float, default=150.0,
+                   help='Best (lowest) makespan anchor — reward 정규화 전용.')
     p.add_argument('--hv_m_ref', type=float, default=500.0,
-                   help='Worst (highest) makespan anchor — HV ref + reward 정규화 + plot x-max.')
-    p.add_argument('--hv_q_best', type=float, default=0.80,
-                   help='Best (highest) yield anchor — reward 정규화 + Pareto plot y-max.')
+                   help='Worst (highest) makespan anchor — HV ref + reward 정규화.')
+    p.add_argument('--hv_q_best', type=float, default=0.85,
+                   help='Best (highest) yield anchor — reward 정규화 전용.')
     p.add_argument('--hv_q_ref', type=float, default=0.50,
-                   help='Worst (lowest) yield anchor — HV ref + reward 정규화 + plot y-min.')
+                   help='Worst (lowest) yield anchor — HV ref + reward 정규화.')
     p.add_argument('--ckpt', type=str, default='checkpoints/hfsp_base_quality.pt',
                    help='Path to save best-HV checkpoint.')
     p.add_argument('--est_slot', type=_parse_est_frac, default=0,
