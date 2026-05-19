@@ -51,7 +51,7 @@ from DataRecorder import DataRecorder
 # =====================================================
 def default_model_params(embedding_dim=128, head_num=8, qkv_dim=16,
                         encoder_layer_num=2, ff_hidden_dim=256,
-                        logit_clipping=10):
+                        logit_clipping=5):
     return {
         'embedding_dim': embedding_dim,
         'sqrt_embedding_dim': float(embedding_dim) ** 0.5,
@@ -370,7 +370,7 @@ def train(num_epochs=100,
                         f"ms@0={ep_ms:.1f} q@1={ep_q:.3f} "
                         f"Δms={d_ms:+.2f} Δq={d_q:+.3f} nd={nd_mean:.1f}")
 
-            scatter_path = f"quality_results/pareto_epoch_{epoch}.png"
+            scatter_path = f"train_results/pareto_epoch_{epoch}.png"
             plot_pareto(ms_lam, q_lam, pareto_lambdas,
                         hv_m_best, hv_m_ref, hv_q_best, hv_q_ref,
                         scatter_path, title=f"epoch {epoch}  HV={hv_mean:.3f}")
@@ -417,7 +417,7 @@ if __name__ == "__main__":
     p.add_argument('--num_jobs', type=int, default=25, help='Jobs per scheduling instance.')
     p.add_argument('--machines', type=str, default='5,3,7,3,5,7',
                    help='Comma-separated machine counts per stage. len = num_stages.')
-    p.add_argument('--epochs', type=int, default=200,
+    p.add_argument('--epochs', type=int, default=400,
                    help='Total training epochs. 1 epoch = 1 optimizer step.')
     p.add_argument('--n_accum', type=int, default=1,
                    help='Gradient accumulation: micro-rollouts per optimizer step. '
@@ -427,7 +427,7 @@ if __name__ == "__main__":
                         'B 시나리오 × B 람다 1:1 매칭, 각 페어에 P pomo 샘플.')
     p.add_argument('--pomo_size', type=int, default=64,
                    help='P = POMO samples per (scenario, λ) — same instance, different trajectories.')
-    p.add_argument('--eval_interval', type=int, default=10,
+    p.add_argument('--eval_interval', type=int, default=20,
                    help='Pareto eval every N epochs (also forces eval at last epoch).')
     p.add_argument('--eval_batch_size', type=int, default=32*10,
                    help='Total instances in Pareto eval (LB). Must be divisible by --pareto_lambdas. ')

@@ -175,12 +175,12 @@ class EncodingBlock(nn.Module):
         qkv_dim = self.model_params['qkv_dim']
 
         # POCCO eq.(8) FiLM conditioner: γ = 1 + W_γ(λ),  β = W_β(λ).
-        # small-normal init (std=0.02): init 시점부터 λ 가 미세하게 출력에 흘러가
-        # gradient self-amplification 경로가 깨어있음. post-norm 이 폭주 자동 억제.
+        # small-normal init (std=0.01): init 시점부터 λ 가 미세하게 출력에 흘러가
+        # gradient self-amplification 경로가 깨어있도록. 
         self.W_gamma = nn.Linear(embedding_dim, embedding_dim)
         self.W_beta  = nn.Linear(embedding_dim, embedding_dim)
-        nn.init.normal_(self.W_gamma.weight, std=0.02); nn.init.zeros_(self.W_gamma.bias)
-        nn.init.normal_(self.W_beta.weight,  std=0.02); nn.init.zeros_(self.W_beta.bias)
+        nn.init.normal_(self.W_gamma.weight, std=0.01); nn.init.zeros_(self.W_gamma.bias)
+        nn.init.normal_(self.W_beta.weight,  std=0.01); nn.init.zeros_(self.W_beta.bias)
 
         self.Wq = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
         self.Wk = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
