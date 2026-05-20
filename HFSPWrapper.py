@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from hummingbird.ml import load
 
-from HFSPGraphEnv import HFSPGraphEnv, sample_sjf_v2_action
+from HFSPGraphEnv import HFSPGraphEnv, sample_est_action
 from FFSPModel import FFSPModel
 
 # =====================================================
@@ -427,7 +427,7 @@ def sil_pomo_rollout(env: HFSPGraphEnv, model: FFSPModel,
             # sample_sjf_v2_action 은 env-edge idx 를 돌려주므로 역변환 필요:
             #   env_edge = env_edge_lookup[op_for_j, machine_idx] → (machine_idx, op→job) 추출.
             if sjf_slot_mask is not None:
-                sjf_env_edge = sample_sjf_v2_action(env, {'feasible_mask': env.feasible_mask})
+                sjf_env_edge = sample_est_action(env, {'feasible_mask': env.feasible_mask})
                 sjf_machine_idx = env.edge_machine[sjf_env_edge]
                 sjf_op_idx = env.edge_op[sjf_env_edge]
                 sjf_job_idx = sjf_op_idx // env.num_stages

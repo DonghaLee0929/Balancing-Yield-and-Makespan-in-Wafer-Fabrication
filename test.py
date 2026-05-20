@@ -20,7 +20,7 @@ import pandas as pd
 import torch
 import matplotlib.pyplot as plt
 
-from HFSPGraphEnv import HFSPGraphEnv
+from HFSPGraphEnv import HFSPGraphEnv, sample_est_action
 from FFSProblemDef import load_problems_from__quality_file
 from FFSPModel import FFSPModel
 from HFSPWrapper import (
@@ -135,24 +135,48 @@ def schedule_paths_1indexed(env: HFSPGraphEnv) -> np.ndarray:
 # =====================================================
 # Evaluation
 # =====================================================
+def _rollout_loop_est(env: HFSPGraphEnv, obs, device) -> torch.Tensor:
+    """ESTv2 휴리스틱 rollout — λ/quality 무관, 결정론적. (BP,) makespan reward G 반환.
+
+    모델 대신 sample_est_v2_action (EST 우선, tie-break 처리시간) 으로 매 step action 선택.
+    λ 를 보지 않으므로 BP 안의 모든 trajectory 가 (동일 proc_time 이면) 같은 결과 → Pareto 1점.
+    """
+    BP = env.batch_size
+    total_reward = torch.zeros(BP, dtype=torch.float32, device=device)
+    T = env.num_ops
+    for t in range(T):
+        actions = sample_est_action(env, obs)
+        obs, reward, _ = env.step(actions, last=(t == T - 1))
+        total_reward += reward
+    return total_reward
+
+
 def _run_single_experiment(
     model, env, env_edge_lookup_t, device,
     quality_helper, scorer,
     problems_INT_list, wq_1,
     lam_all_t, total, B, seed, greedy,
+    method: str = 'model',
 ) -> tuple[np.ndarray, np.ndarray]:
-    """단일 (Q, paths) 인스턴스에 대해 λ-sweep 1회 → (makespans[total], yields[total])."""
+    """단일 (Q, paths) 인스턴스에 대해 λ-sweep 1회 → (makespans[total], yields[total]).
+
+    method='model' : 학습된 λ-conditioned 모델 rollout.
+    method='est'    : EST 휴리스틱 rollout (λ 무관, 모델 불필요). yield 계산은 동일.
+    """
     BP = B * total
     ept_bp = problems_to_edge_proc_time(problems_INT_list, env, BP)         # (BP, NE) torch
     wq_bp  = wq_1.to(device).float().repeat(total, 1) if wq_1 is not None else None  # (BP, J)
-    env.reset(seed=seed, batch_size=BP,
-              edge_proc_time=ept_bp, identical_job=True)
+    obs = env.reset(seed=seed, batch_size=BP,
+                    edge_proc_time=ept_bp, identical_job=True)
     with torch.no_grad():
-        _, G = _rollout_loop(env, model, env_edge_lookup_t, device,
-                             B=B, P=total, greedy=greedy, with_grad=False,
-                             wafer_quality_t=wq_bp,
-                             lambdas_t=lam_all_t,
-                             quality_helper=quality_helper)
+        if method == 'est':
+            G = _rollout_loop_est(env, obs, device)
+        else:
+            _, G = _rollout_loop(env, model, env_edge_lookup_t, device,
+                                 B=B, P=total, greedy=greedy, with_grad=False,
+                                 wafer_quality_t=wq_bp,
+                                 lambdas_t=lam_all_t,
+                                 quality_helper=quality_helper)
     makespans = (-G).cpu().numpy().astype(np.float32)                       # (BP,)
     if scorer is not None:
         paths_3d = schedule_paths_1indexed(env)                             # (BP, J, S) np
@@ -221,6 +245,7 @@ def evaluate_pareto(
     samples=1,
     seed=0,
     save_path='pareto_front.png',
+    method: str = 'model',
     yield_mode: str = 'raw',
     single_view: str = 'best',
     hv_m_best: float = 30.0,
@@ -247,6 +272,8 @@ def evaluate_pareto(
         'percentile' — path product quality 의 전체 분포 대비 백분위 (job 평균)
     """
     p_csv = f'quality_data/P_{p_idx}.csv'
+    if method not in ('model', 'est'):
+        raise ValueError(f"method must be 'model' or 'est', got {method!r}")
     if yield_mode not in ('raw', 'percentile'):
         raise ValueError(f"yield_mode must be 'raw' or 'percentile', got {yield_mode!r}")
     if single_view not in ('best', 'all'):
@@ -269,20 +296,23 @@ def evaluate_pareto(
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.manual_seed(seed)
 
-    # ── checkpoint / model (Q-independent, 한 번만 로드) ──
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    row_feat_dim = ckpt['row_feat_dim']
-    col_feat_dim = ckpt['col_feat_dim']
-    model_params = ckpt['model_params']
-
+    # ── env (method 무관) ──
     env = HFSPGraphEnv(num_jobs=num_jobs, machine_cnt_list=list(machine_cnt_list), device=device)
     env_edge_lookup_t = make_env_edge_lookup(env).to(device)
-    edge_feat_dim = (ckpt.get('edge_feat_dim')
-                     or model_params.pop('edge_feature_dim', None)
-                     or get_feat_dims(env)[2])
-    model = FFSPModel(row_feat_dim, col_feat_dim, edge_feat_dim, **model_params).to(device)
-    model.load_state_dict(ckpt['model'])
-    model.eval()
+
+    # ── checkpoint / model (Q-independent, 한 번만 로드) — EST baseline 은 모델 불필요 ──
+    model = None
+    if method == 'model':
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        row_feat_dim = ckpt['row_feat_dim']
+        col_feat_dim = ckpt['col_feat_dim']
+        model_params = ckpt['model_params']
+        edge_feat_dim = (ckpt.get('edge_feat_dim')
+                         or model_params.pop('edge_feature_dim', None)
+                         or get_feat_dims(env)[2])
+        model = FFSPModel(row_feat_dim, col_feat_dim, edge_feat_dim, **model_params).to(device)
+        model.load_state_dict(ckpt['model'])
+        model.eval()
 
     # ── 고정 proc time ──
     problems_INT_list = load_problems_from__quality_file(
@@ -294,7 +324,12 @@ def evaluate_pareto(
     lam_all_t  = lam_grid_t.repeat_interleave(samples)            # (total,)
     lam_grid_np = lam_grid_t.cpu().numpy()                                   # (N,) — plot 좌표
 
-    print(f"[eval] ckpt={ckpt_path}  device={device}  yield_mode={yield_mode}")
+    print(f"[eval] method={method}  "
+          f"ckpt={ckpt_path if method == 'model' else '(none, EST)'}  "
+          f"device={device}  yield_mode={yield_mode}")
+    if method == 'est' and (num_lambdas > 1 or samples > 1):
+        print(f"[eval] NOTE: EST 는 lambda/quality 무관 결정론적 휴리스틱 - "
+              f"lambda-sweep/samples 가 모두 동일 점으로 수렴 (Pareto front = 1점)")
     print(f"[eval] jobs={num_jobs}  machines={list(machine_cnt_list)}  "
           f"NE={env.num_edges}  num_lambdas={num_lambdas}  "
           f"samples/λ={samples}  total={total}  greedy={greedy}")
@@ -334,7 +369,8 @@ def evaluate_pareto(
             model, env, env_edge_lookup_t, device,
             quality_helper, scorer,
             problems_INT_list, wq_1,
-            lam_all_t, total, B, seed, greedy)
+            lam_all_t, total, B, seed, greedy,
+            method=method)
         runs_ms[r]  = ms
         runs_yld[r] = yld
 
@@ -393,11 +429,15 @@ def evaluate_pareto(
         run_tag = f'paths_{paths_idx_list[0]}'
     else:
         run_tag = f'paths {paths_idx_list[0]}~{paths_idx_list[-1]}'
-    if show_all:
+    if method == 'EST':
+        scatter_label = 'EST (λ-independent)'
+    elif show_all:
         scatter_label = f'per-λ all samples'
     else:
         scatter_label = f'per-λ best average'
-    title = (f'W={num_jobs}, (Q{q_idx},P{p_idx}), {run_tag}, λ=x{num_lambdas}, s={title_mode}')
+    method_tag = 'EST' if method == 'est' else 'model'
+    title = (f'[{method_tag}] W={num_jobs}, (Q{q_idx},P{p_idx}), {run_tag}, '
+             f'λ=x{num_lambdas}, s={title_mode}')
 
     front_idx = plot_pareto(
         plot_ms, plot_yld, plot_lam, save_path, title,
@@ -413,7 +453,12 @@ def evaluate_pareto(
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument('--ckpt',        type=str, default='checkpoints/saved_J25_large_0517.pt')
+    p.add_argument('--ckpt',        type=str, default='checkpoints/saved_J25_anchor_0519.pt')
+    p.add_argument('--method',      type=str, default='est',
+                   choices=['model', 'est'],
+                   help="스케줄링 정책. 'model' = 학습된 λ-conditioned 모델, "
+                        "'est' = EST 휴리스틱 baseline (λ 무관, ckpt 불필요). "
+                        "yield 계산(raw/percentile)은 두 경우 동일.")
     p.add_argument('--num_jobs',    type=int, default=15)
     p.add_argument('--machines',    type=str, default='5,3,7,3,5,7')
     p.add_argument('--yield_mode',  type=str, default='percentile',
@@ -475,7 +520,7 @@ if __name__ == "__main__":
     xlim, xticks = _parse_axis(args.xlim)
     ylim, yticks = _parse_axis(args.ylim)
     paths_tag = args.paths_idx.replace('~', '-').replace(',', '+')
-    save_path = f'test_results/J{args.num_jobs}_Q{args.q_idx}_P{args.p_idx}_p{len(paths_idx_list)}_s{args.samples}.png'
+    save_path = f'test_results/{args.method}_J{args.num_jobs}_Q{args.q_idx}_P{args.p_idx}_p{len(paths_idx_list)}_s{args.samples}.png'
     evaluate_pareto(
         ckpt_path=args.ckpt,
         p_idx=args.p_idx,
@@ -486,6 +531,7 @@ if __name__ == "__main__":
         num_lambdas=args.num_lambdas,
         samples=args.samples,
         save_path=save_path,
+        method=args.method,
         yield_mode=args.yield_mode,
         single_view=args.single_view,
         hv_m_best=xlim[0],

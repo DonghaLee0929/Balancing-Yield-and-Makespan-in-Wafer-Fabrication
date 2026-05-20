@@ -552,9 +552,9 @@ def run_random_agent(env: HFSPGraphEnv, seed=0, B=1, verbose=False):
     makespans = -total_reward
     return makespans, T
 
-def sample_sjf_v2_action(env: HFSPGraphEnv, obs):
+def sample_est_action(env: HFSPGraphEnv, obs):
     """
-    SJFv2 (Time-driven 환경 완벽 에뮬레이션)
+    EST (Time-driven 환경 완벽 에뮬레이션)
     1. 가장 일찍 시작할 수 있는(비어있는) 기계를 최우선으로 찾음 (est_jm)
     2. 만약 동시에 비어있는 기계가 여러 개라면, 처리 시간이 짧은 기계 선택 (proc_jm)
     """
@@ -589,7 +589,7 @@ def sample_sjf_v2_action(env: HFSPGraphEnv, obs):
     
     return actions
 
-def run_sjf_agent(env: HFSPGraphEnv, seed=0, B=1, verbose=False):
+def run_est_agent(env: HFSPGraphEnv, seed=0, B=1, verbose=False):
     torch.manual_seed(seed)
     obs = env.reset(seed=seed, batch_size=B, identical_job=True)
     total_reward = torch.zeros(B, dtype=torch.long, device=env.device)
@@ -597,8 +597,8 @@ def run_sjf_agent(env: HFSPGraphEnv, seed=0, B=1, verbose=False):
     # 총 step 수 = env.num_ops (J * S)
     T = env.num_ops
     for steps in range(T):
-        # Random 대신 SJF action 선택
-        actions = sample_sjf_v2_action(env, obs)
+        # Random 대신 EST action 선택
+        actions = sample_est_action(env, obs)
         
         if verbose and steps < 5:
             n_feas = obs['feasible_mask'].sum(dim=1)
@@ -630,10 +630,10 @@ if __name__ == "__main__":
           f"#edges={env.num_edges}  batch={BATCH_SIZE}")
 
     # Warm-up (최초 JIT 컴파일/CUDA 초기화 비용 제외용)
-    _, _ = run_sjf_agent(env, seed=0, B=2, verbose=False)
+    _, _ = run_est_agent(env, seed=0, B=2, verbose=False)
 
     t0 = time.time()
-    makespans, steps = run_sjf_agent(env, seed=42, B=BATCH_SIZE, verbose=True)
+    makespans, steps = run_est_agent(env, seed=42, B=BATCH_SIZE, verbose=True)
     dt = time.time() - t0
     
     print(f"\nbatched run: steps={steps}  elapsed={dt:.3f}s  ({BATCH_SIZE/dt:.1f} ep/s)")
@@ -646,8 +646,8 @@ if __name__ == "__main__":
     best_idx = int(makespans.argmin().item())
     env.render_schedule(
         batch_idx=best_idx,
-        save_path="gantt_sjf_torch.png",
-        title=f"SJF Agent (torch, batch {best_idx})",
+        save_path="gantt_est_torch.png",
+        title=f"EST Agent (torch, batch {best_idx})",
     )
-    print(f"[render] saved gantt_sjf_torch.png  (batch={best_idx}, "
+    print(f"[render] saved gantt_est_torch.png  (batch={best_idx}, "
           f"makespan={makespans[best_idx].item()})")
