@@ -61,7 +61,8 @@ def default_model_params(embedding_dim=128, head_num=8, qkv_dim=16,
         'head_num': head_num,
         'logit_clipping': logit_clipping,
         'ff_hidden_dim': ff_hidden_dim,
-        'eval_type': 'argmax',
+        'eval_type': 'argmax',          # 어디에도 영향을 주지 않는 기본값
+        # 학습 sampling: softmax, 학습 eval: argmax, test: samples가 1이면 argmax, 이외엔 softmax  
         'ms_hidden_dim': 16,
         'ms_layer1_init': (1 / 2) ** 0.5,
         'ms_layer2_init': (1 / 16) ** 0.5,
@@ -111,30 +112,19 @@ def compute_random_baseline(env, quality_helper, B, P, seed=0):
 # 한 step 의 effective (scenario, λ) 페어 = n_accum × B.
 # eval_interval epoch 마다 λ sweep 으로 Pareto eval 수행, HV 갱신 시 ckpt 저장.
 # =====================================================
-def train(num_epochs=100,
-          n_accum=5,
-          batch_size=50,
-          pomo_size=24,
-          num_jobs=20,
-          machine_cnt_list=(5, 3, 7, 3, 5, 7),
+def train(num_epochs, n_accum, batch_size, pomo_size, 
+          num_jobs, machine_cnt_list, 
+          eval_interval, eval_batch_size, pareto_lambda_count, ckpt_path, 
+          hv_m_best, hv_m_ref, hv_q_best, hv_q_ref,
+          est_slot_frac, 
+          wandb_enabled, wandb_project, wandb_run_name,
           time_low=3, time_high=22,
           lr=3e-4,
           weight_decay=0.1,
           adam_betas=(0.9, 0.95),
           warmup_ratio=0.1,
-          eval_interval=10,
-          eval_batch_size=256,
-          pareto_lambda_count=32,
-          hv_m_best=30.0,
-          hv_m_ref=110.0,
-          hv_q_best=1.0,
-          hv_q_ref=0.90,
-          ckpt_path='checkpoints/hfsp_pomo.pt',
           seed=1,
-          est_slot_frac=0.3,
-          wandb_enabled=True,
-          wandb_project='hfsp-asil',
-          wandb_run_name=None):
+          ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.manual_seed(seed)
 
@@ -245,7 +235,8 @@ def train(num_epochs=100,
     # ── HV reference point (fixed across all epochs, user-specified) ──
     # 2D hypervolume 의 ref point 는 epoch 간 HV 가 같은 좌표계에서 비교되도록 고정.
     # m_ref = "worst makespan" anchor, q_ref = "worst yield" anchor.
-    lam_pool = torch.linspace(0.0, 1.0, 101, dtype=torch.float32, device=device)
+    lam_num = 101
+    lam_pool = torch.linspace(0.0, 1.0, lam_num, dtype=torch.float32, device=device)
     pareto_lambdas = torch.linspace(0.0, 1.0, int(pareto_lambda_count),
                                     dtype=torch.float32, device=device)
     best_eval = -float('inf')    # track best HV across epochs (higher = better)
@@ -271,7 +262,7 @@ def train(num_epochs=100,
             gen = torch.Generator(device=device).manual_seed(chunk_seed)
 
             # linspace(0,1,101) pool 에서 B 개 인덱스를 균등 추출 → (B,) instance-level λ.
-            lam_idx = torch.randint(0, 101, (B,), generator=gen, device=device)
+            lam_idx = torch.randint(0, lam_num, (B,), generator=gen, device=device)
             lambdas_b = lam_pool[lam_idx]
 
             # λ-conditioned SIL rollout — batch layout: B unique (scenario, λ) × P pomo samples.
