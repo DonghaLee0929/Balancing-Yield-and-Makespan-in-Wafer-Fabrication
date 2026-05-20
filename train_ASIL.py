@@ -440,7 +440,7 @@ if __name__ == "__main__":
                    help='Worst (lowest) yield anchor — HV ref + reward 정규화.')
     p.add_argument('--ckpt', type=str, default='checkpoints/hfsp_base_quality.pt',
                    help='Path to save best-HV checkpoint.')
-    p.add_argument('--est_slot', type=_parse_est_frac, default=1.0,
+    p.add_argument('--est_slot', type=_parse_est_frac, default=0,
                    help='EST heuristic injection curriculum. '
                         'Float f in [0,1]: 처음 f·epochs 동안만 P 샘플 마지막 1개를 sample_est_v2_action 으로 대체, '
                         'cutoff 이후 모델 자력 학습. None/false/off/0: 처음부터 안 씀. 1.0: 학습 끝까지 inject. '

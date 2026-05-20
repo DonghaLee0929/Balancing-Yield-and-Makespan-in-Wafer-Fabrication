@@ -186,6 +186,7 @@ class QualityHelper:
             mu  = marg.mean(dim=-1, keepdim=True)
             std = marg.std(dim=-1, keepdim=True)
             z   = (marg - mu) / std.clamp(min=1e-8) * Z_SCALE
+            z   = z - z.min(dim=-1, keepdim=True).values   # prefix별 최소를 0으로 시프트
             path_zscore.append(z.to(torch.float32))
 
         M = env.total_machines
@@ -285,7 +286,13 @@ def build_model_state(env: HFSPGraphEnv,
         edge_pool['quality_zscore'] = (q_z_t if q_z_t is not None
                                         else torch.zeros(BP, J, M, dtype=torch.float32, device=device))
     edge_feat = torch.stack([edge_pool[n] for n in names['edge']], dim=-1)
-    edge_feat.masked_fill_(~env.valid_edge_3d.unsqueeze(-1), 0.0)
+    # 채널별 마스킹:
+    #  - proc_time : 모든 (j, m) 에서 실제 처리시간 유지 (과거/현재/미래 stage 전부) → 마스킹 제외.
+    #  - 그 외(est/eft/quality_zscore) : 실제 선택 가능한 엣지(active op stage = valid_edge_3d) 외엔 -1 패딩.
+    #    (모두 정상값이 >=0 이라 -1 은 깨끗한 sentinel. feasibility 는 edge_mask 가 따로 처리.)
+    mask_inv = (~env.valid_edge_3d).unsqueeze(-1).expand(-1, -1, -1, edge_feat.size(-1)).clone()
+    mask_inv[..., names['edge'].index('proc_time')] = False
+    edge_feat.masked_fill_(mask_inv, -1.0)
 
     if lambdas_t is None:
         lambdas_t = torch.zeros(BP, dtype=torch.float32, device=device)

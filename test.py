@@ -73,10 +73,15 @@ def compute_pareto_front(makespan: np.ndarray, yld: np.ndarray) -> np.ndarray:
 class PathPercentileScorer:
     """historical_paths CSV 의 (stage, machine) quality factor 로 path 의 percentile 계산.
 
+    ⚠ 평가(test) 전용 ground-truth. CSV 의 실제 quality factor 를 직접 읽으므로
+       이 클래스/메서드를 train_ASIL.py 등 학습 코드에서 절대 import·사용하지 말 것.
+       학습은 QualityHelper.compute_yield (예측 모델) 만 reward 로 써야 한다.
+
     1) CSV 의 "Step s quality" 컬럼을 보고 (stage s, machine m) 쌍별 quality factor 를 추출.
        각 (stage, machine) 의 값이 CSV 내에서 일정해야 함 (deterministic per-(stage,machine)).
     2) machine_cnt_list 로부터 가능한 모든 path 의 product quality 분포를 사전 계산.
-    3) score(paths) → 각 path 의 product 가 전체 분포에서 차지하는 백분위 (0–100).
+    3) path_product(paths) → path 따라 quality factor 곱 (raw ground-truth yield 의 핵심).
+    4) score(paths)        → 각 path 의 product 가 전체 분포에서 차지하는 백분위 (0–100).
     """
 
     def __init__(self, csv_path: str, machine_cnt_list: list[int]):
@@ -107,8 +112,11 @@ class PathPercentileScorer:
               f"product range=[{self.all_products_sorted[0]:.4f}, "
               f"{self.all_products_sorted[-1]:.4f}]")
 
-    def score(self, paths_1indexed: np.ndarray) -> np.ndarray:
-        """paths: (..., S) 1-indexed machine indices → percentile (..., ) in [0, 100]."""
+    def path_product(self, paths_1indexed: np.ndarray) -> np.ndarray:
+        """paths: (..., S) 1-indexed → (stage,machine) quality factor 의 path 곱 (...,).
+
+        초기 wafer_quality 를 곱하기 전의 path 품질 — raw ground-truth yield 의 핵심.
+        """
         S = self.num_stages
         if paths_1indexed.shape[-1] != S:
             raise ValueError(
@@ -117,10 +125,14 @@ class PathPercentileScorer:
         q = np.empty_like(flat, dtype=np.float64)
         for s in range(S):
             q[:, s] = self.step_q[s, flat[:, s] - 1]
-        prod = q.prod(axis=1)                                       # (N,)
-        rank = np.searchsorted(self.all_products_sorted, prod, side='right')
+        return q.prod(axis=1).reshape(paths_1indexed.shape[:-1])
+
+    def score(self, paths_1indexed: np.ndarray) -> np.ndarray:
+        """paths: (..., S) 1-indexed machine indices → percentile (..., ) in [0, 100]."""
+        prod = self.path_product(paths_1indexed)                    # (...,)
+        rank = np.searchsorted(self.all_products_sorted, prod.reshape(-1), side='right')
         pct = rank.astype(np.float64) / self.n_paths * 100.0
-        return pct.reshape(paths_1indexed.shape[:-1])
+        return pct.reshape(prod.shape)
 
 
 def schedule_paths_1indexed(env: HFSPGraphEnv) -> np.ndarray:
@@ -157,11 +169,14 @@ def _run_single_experiment(
     problems_INT_list, wq_1,
     lam_all_t, total, B, seed, greedy,
     method: str = 'model',
+    yield_mode: str = 'raw',
 ) -> tuple[np.ndarray, np.ndarray]:
     """단일 (Q, paths) 인스턴스에 대해 λ-sweep 1회 → (makespans[total], yields[total]).
 
     method='model' : 학습된 λ-conditioned 모델 rollout.
     method='est'    : EST 휴리스틱 rollout (λ 무관, 모델 불필요). yield 계산은 동일.
+
+    yield 점수는 항상 ground-truth (scorer 기반) — 예측 모델(compute_yield) 미사용.
     """
     BP = B * total
     ept_bp = problems_to_edge_proc_time(problems_INT_list, env, BP)         # (BP, NE) torch
@@ -178,13 +193,16 @@ def _run_single_experiment(
                                  lambdas_t=lam_all_t,
                                  quality_helper=quality_helper)
     makespans = (-G).cpu().numpy().astype(np.float32)                       # (BP,)
-    if scorer is not None:
-        paths_3d = schedule_paths_1indexed(env)                             # (BP, J, S) np
-        pct_bj   = scorer.score(paths_3d)                                   # (BP, J)
-        yields   = pct_bj.mean(axis=1).astype(np.float32)                   # (BP,)
-    else:
-        yields   = (quality_helper.compute_yield(env, wq_bp, aggregate="mean")
-                    .cpu().numpy().astype(np.float32))
+    # yield 점수는 항상 ground-truth — historical_paths CSV 의 (stage,machine)
+    # quality factor 를 path 따라 곱한 값 기반. (예측 모델 compute_yield 미사용)
+    paths_3d = schedule_paths_1indexed(env)                                 # (BP, J, S) np
+    if yield_mode == 'percentile':
+        # 초기 품질은 모든 path 에 균일하게 곱해지는 상수 → percentile rank 불변.
+        yields = scorer.score(paths_3d).mean(axis=1).astype(np.float32)     # (BP,)
+    else:  # 'raw' : path 따라 quality factor 곱 × 초기 wafer_quality, job 평균
+        prod_bj = scorer.path_product(paths_3d)                             # (BP, J)
+        wq_np   = wq_bp.cpu().numpy()                                       # (BP, J) 초기 품질
+        yields  = (prod_bj * wq_np).mean(axis=1).astype(np.float32)         # (BP,)
     return makespans, yields
 
 
@@ -214,7 +232,7 @@ def plot_pareto(
     plt.colorbar(sc, ax=ax, label='λ (0 = makespan-only,  1 = yield-only)')
     ax.plot(makespans[front_idx], yields[front_idx],
             '-o', color='crimson', markersize=5, linewidth=1.3,
-            label='Pareto Front')
+            label=f'Pareto Front (n={len(front_idx)})')
     ax.set_xlabel('Average Makespan ↓')
     ax.set_ylabel(y_axis_label)
     if xlim is not None:
@@ -244,6 +262,8 @@ def evaluate_pareto(
     num_lambdas=51,
     samples=1,
     seed=0,
+    wq_min: float = 0.99,
+    wq_max: float = 1.00,
     save_path='pareto_front.png',
     method: str = 'model',
     yield_mode: str = 'raw',
@@ -267,9 +287,10 @@ def evaluate_pareto(
     → (N_runs, num_lambdas) 의 (ms, yld) 를 paths_idx 축으로 평균
     → 최종 num_lambdas 점들로 Pareto front.
 
-    yield_mode:
-        'raw'        — QualityHelper predicted yield 평균
-        'percentile' — path product quality 의 전체 분포 대비 백분위 (job 평균)
+    yield_mode (둘 다 ground-truth — historical_paths CSV 의 quality factor 기반,
+                예측 모델 미사용. ⚠ 평가 전용, 학습엔 절대 사용 금지):
+        'raw'        — (stage,machine) quality factor 의 path 곱 × 초기 wafer_quality, job 평균
+        'percentile' — 위 path 곱의 전체 분포 대비 백분위 (job 평균; 초기 품질은 rank 불변)
     """
     p_csv = f'quality_data/P_{p_idx}.csv'
     if method not in ('model', 'est'):
@@ -290,6 +311,11 @@ def evaluate_pareto(
         raise ValueError(f"num_lambdas must be >= 2, got {num_lambdas}")
     if samples < 1:
         raise ValueError(f"samples_per_lambda must be >= 1, got {samples}")
+    wq_min = float(wq_min)
+    wq_max = float(wq_max)
+    if not (0.0 <= wq_min <= wq_max):
+        raise ValueError(
+            f"require 0 <= wq_min <= wq_max, got wq_min={wq_min}, wq_max={wq_max}")
     total = num_lambdas * samples
     greedy = (samples == 1)
     N_runs = len(paths_idx_list)
@@ -334,6 +360,9 @@ def evaluate_pareto(
           f"NE={env.num_edges}  num_lambdas={num_lambdas}  "
           f"samples/λ={samples}  total={total}  greedy={greedy}")
     print(f"[eval] proc_time <- {p_csv}")
+    print(f"[eval] wafer_quality ~ U[{wq_min:.4f}, {wq_max:.4f}]"
+          + ("  (raw yield 에 직접 반영)" if yield_mode == 'raw'
+             else "  (percentile: yield 값엔 무관, 모델 입력에만 반영)"))
     print(f"[eval] Q_{q_idx}  paths_idx_list={paths_idx_list}  N_runs={N_runs}")
 
     if device.type == 'cuda':
@@ -355,12 +384,15 @@ def evaluate_pareto(
         if not quality_helper.is_active:
             raise RuntimeError(
                 f"quality pipeline not available — {model_path}, {wafer_path} 확인")
+        # CSV/JSON 기본 범위(하드코딩) 를 CLI 입력으로 덮어씀 → U[wq_min, wq_max] 샘플.
+        quality_helper.wafer_quality_min = wq_min
+        quality_helper.wafer_quality_max = wq_max
         wq_1 = quality_helper.sample_wafer_quality(
             B=1, num_jobs=num_jobs, seed=seed + r, device=device)
         if wq_1 is None:
             raise RuntimeError("wafer_quality 샘플링 실패 (quality_helper inactive?)")
-        scorer = (PathPercentileScorer(wq_csv, list(machine_cnt_list))
-                  if yield_mode == 'percentile' else None)
+        # raw/percentile 둘 다 CSV quality factor 기반 ground-truth → 항상 생성.
+        scorer = PathPercentileScorer(wq_csv, list(machine_cnt_list))
 
         print(f"[run {r+1}/{N_runs}] paths_idx={paths_idx}  "
               f"wq=[{wq_1.min().item():.4f},{wq_1.max().item():.4f}] "
@@ -370,7 +402,7 @@ def evaluate_pareto(
             quality_helper, scorer,
             problems_INT_list, wq_1,
             lam_all_t, total, B, seed, greedy,
-            method=method)
+            method=method, yield_mode=yield_mode)
         runs_ms[r]  = ms
         runs_yld[r] = yld
 
@@ -436,7 +468,7 @@ def evaluate_pareto(
     else:
         scatter_label = f'per-λ best average'
     method_tag = 'EST' if method == 'est' else 'model'
-    title = (f'[{method_tag}] W={num_jobs}, (Q{q_idx},P{p_idx}), {run_tag}, '
+    title = (f'W={num_jobs}, (Q{q_idx},P{p_idx}), {run_tag}, '
              f'λ=x{num_lambdas}, s={title_mode}')
 
     front_idx = plot_pareto(
@@ -453,18 +485,19 @@ def evaluate_pareto(
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument('--ckpt',        type=str, default='checkpoints/saved_J25_anchor_0519.pt')
-    p.add_argument('--method',      type=str, default='est',
+    p.add_argument('--ckpt',        type=str, default='checkpoints/saved_J25_baseline_0519.pt')
+    p.add_argument('--method',      type=str, default='model',
                    choices=['model', 'est'],
                    help="스케줄링 정책. 'model' = 학습된 λ-conditioned 모델, "
                         "'est' = EST 휴리스틱 baseline (λ 무관, ckpt 불필요). "
                         "yield 계산(raw/percentile)은 두 경우 동일.")
     p.add_argument('--num_jobs',    type=int, default=15)
     p.add_argument('--machines',    type=str, default='5,3,7,3,5,7')
-    p.add_argument('--yield_mode',  type=str, default='percentile',
+    p.add_argument('--yield_mode',  type=str, default='raw',
                    choices=['raw', 'percentile'],
-                   help="'raw' = predicted yield, 'percentile' = path product 의 "
-                        "전체 분포 대비 백분위 (job 평균, wafer_quality 무관)")
+                   help="둘 다 ground-truth (CSV quality factor 기반, 예측 모델 미사용). "
+                        "'raw' = quality factor 의 path 곱 × 초기 품질 (job 평균), "
+                        "'percentile' = 그 path 곱의 전체 분포 대비 백분위 (job 평균)")
     p.add_argument('--num_lambdas',        type=int, default=32,
                    help='λ grid 크기. linspace(0,1,N) 으로 sweep.')
     p.add_argument('--samples', type=int, default=1,
@@ -489,6 +522,10 @@ if __name__ == "__main__":
                         "(예: '40,170,30' → tick 40,70,100,130,160; xlim=170).")
     p.add_argument('--ylim', type=str, default='40,101,10',
                    help="y축 (yield/percentile) 범위. 'lo,hi' 또는 'lo,hi,step'.")
+    p.add_argument('--wafer_quality', type=str, default='0.90,0.90',
+                   help="초기 웨이퍼 품질 U[lo,hi] 샘플 범위. 'lo,hi' (예: '0.99,1.00'). "
+                        "lo==hi 면 모든 job 이 상수 품질 (예: '1.00,1.00'). "
+                        "raw yield 엔 직접 반영, percentile 모드에선 모델 입력에만 반영.")
     args = p.parse_args()
 
     machines = [int(x) for x in args.machines.split(',')]
@@ -519,6 +556,12 @@ if __name__ == "__main__":
 
     xlim, xticks = _parse_axis(args.xlim)
     ylim, yticks = _parse_axis(args.ylim)
+
+    wq_parts = [float(x) for x in args.wafer_quality.split(',')]
+    if len(wq_parts) != 2:
+        raise ValueError(f"--wafer_quality must be 'lo,hi', got: {args.wafer_quality!r}")
+    wq_min, wq_max = wq_parts
+
     paths_tag = args.paths_idx.replace('~', '-').replace(',', '+')
     save_path = f'test_results/{args.method}_J{args.num_jobs}_Q{args.q_idx}_P{args.p_idx}_p{len(paths_idx_list)}_s{args.samples}.png'
     evaluate_pareto(
@@ -530,6 +573,8 @@ if __name__ == "__main__":
         machine_cnt_list=machines,
         num_lambdas=args.num_lambdas,
         samples=args.samples,
+        wq_min=wq_min,
+        wq_max=wq_max,
         save_path=save_path,
         method=args.method,
         yield_mode=args.yield_mode,

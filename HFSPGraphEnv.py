@@ -66,6 +66,14 @@ class HFSPGraphEnv:
             (self.num_ops, self.total_machines), -1, dtype=torch.long, device=self.device)
         self.env_edge_lookup[self.edge_op, self.edge_machine] = torch.arange(self.num_edges, device=self.device)
 
+        # (J, M) → edge idx : job j 의 "machine m 의 stage 에 해당하는 operation" 의 엣지.
+        # 모든 (j, m) 에서 항상 유효(>=0). proc_time 채널을 active op 한정이 아니라 모든 stage
+        # (과거/현재/미래) 의 처리시간으로 노출하기 위한 정적 룩업.
+        job_arange0 = torch.arange(self.num_jobs, device=self.device)
+        op_at_m_stage = job_arange0.unsqueeze(1) * self.num_stages + self.machine_stage.unsqueeze(0)   # (J, M)
+        m_arange0 = torch.arange(self.total_machines, device=self.device)
+        self.full_edge_idx = self.env_edge_lookup[op_at_m_stage, m_arange0.unsqueeze(0)]               # (J, M)
+
         # job-wise predecessor (batch-shared) — stage 0 은 -1
         arange_ops = torch.arange(self.num_ops, device=self.device)
         self.prev_op_in_job = torch.where(self.op_stage > 0, arange_ops - 1,
@@ -218,14 +226,15 @@ class HFSPGraphEnv:
         active_op, is_done = derive_active_op(op_status, J, S)
         self.active_op = active_op
 
-        # ── (active op × machine) edge index — row remaining_proc / edge pool / edge_mask 공유 ──
+        # ── (active op × machine) edge index — valid_edge_3d / min_est / edge_mask 공유 ──
         edge_idx_3d = self.env_edge_lookup[active_op]                                 # (B, J, M)
         valid_edge_3d = edge_idx_3d >= 0
-        safe_idx_3d = torch.where(valid_edge_3d, edge_idx_3d, torch.zeros_like(edge_idx_3d))
 
-        # proc_time at (active_op, m) — full edge stack 없이 직접 gather
-        proc_jm = self.edge_proc_time.gather(
-            1, safe_idx_3d.view(B, -1)).view(B, J, M).float()                         # (B, J, M)
+        # proc_time : (j, m) 별 "머신 m 의 stage 의 op" 처리시간 — 모든 (j, m) 에서 항상 유효.
+        # active stage 칸에선 active op 의 처리시간과 동일하므로 아래 slot fitting 에도 그대로 사용.
+        # (무효 칸은 found=True 로 루프 본체를 건너뛰어 이 값이 est 에 안 쓰이고, eft 는 wrapper 에서
+        #  -1 로 마스킹되므로 active-op 한정 proc 를 따로 gather 할 필요가 없음.)
+        proc_jm_full = self.edge_proc_time[:, self.full_edge_idx].float()             # (B, J, M)
 
         # ── EST/EFT at active_op (slot fitting per (b, m), J 축은 broadcast) ──
         # 무효 칸(stage 불일치)은 found=True 로 시작해 루프 본체 무시 → 낭비 FLOP 최소화.
@@ -253,14 +262,14 @@ class HFSPGraphEnv:
             s_k = iv_s[..., k]                                                        # (B, 1, M) → broadcast (B, J, M)
             e_k = iv_e[..., k]
             valid_k = k < iv_cnt_b
-            fits = (~found) & valid_k & (s_k - cursor >= proc_jm)
+            fits = (~found) & valid_k & (s_k - cursor >= proc_jm_full)
             slot_start = torch.where(fits, cursor, slot_start)
             found = found | fits
             advance = (~found) & valid_k
             cursor = torch.where(advance, torch.maximum(cursor, e_k), cursor)
 
         est_jm = torch.where(found, slot_start, cursor)                               # (B, J, M)
-        eft_jm = est_jm + proc_jm
+        eft_jm = est_jm + proc_jm_full
 
         # ── min_est = min EST over feasible (= valid_edge_3d & ~is_done) ──
         # active_op 는 항상 status=1 (ready) 이므로 feasibility 는 valid & ~is_done 와 동치.
@@ -334,9 +343,13 @@ class HFSPGraphEnv:
             **{f'stage_id_s{s}': stage_oh_bp[..., s] for s in range(S)},
         }
 
-        # ── edge pool: est/eft re-anchor, stage-mismatch 칸은 wrapper 가 valid_edge_3d 로 0 mask ──
+        # ── edge pool ──
+        # proc_time : (j, m) 별 "머신 m 의 stage 의 op" 처리시간 (proc_jm_full) — 모든 (j,m) 에서
+        #             항상 유효(과거/현재/미래 stage 전부). wrapper 에서 마스킹하지 않음.
+        # est/eft   : active op 기준 슬롯 fitting 값 (min_est 로 re-anchor). 실제 선택 가능한 엣지
+        #             (= valid_edge_3d) 외 칸은 의미 없으므로 wrapper 가 -1 로 패딩.
         self.edge_pool = {
-            'proc_time': proc_jm,
+            'proc_time': proc_jm_full,
             'est':       est_jm - min_est.view(B, 1, 1),
             'eft':       eft_jm - min_est.view(B, 1, 1),
         }

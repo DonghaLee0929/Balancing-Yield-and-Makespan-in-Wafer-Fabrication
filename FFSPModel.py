@@ -54,47 +54,47 @@ class FFSPModel(nn.Module):
         self.decoder = FFSP_Decoder(**model_params)
 
         self.encoded_col = None
-        # shape: (batch x pomo, machine_cnt, embedding)
+        # shape: (batch, machine_cnt, embedding)
         self.encoded_row = None
-        # shape: (batch x pomo, job_cnt, embedding)
+        # shape: (batch, job_cnt, embedding)
 
     def forward(self, state, sample=True):
         # state.BATCH_IDX.shape    : (batch, pomo)
-        # state.row_feature.shape  : (BP, job_cnt, row_feat_dim)
-        # state.col_feature.shape  : (BP, machine_cnt, col_feat_dim)
-        # state.edge_feature.shape : (BP, job_cnt, machine_cnt, edge_feat_dim)
-        # state.edge_mask.shape    : (BP, machine_cnt, job_cnt)
-        # state.finished.shape     : (BP,) bool
+        # state.row_feature.shape  : (B, job_cnt, row_feat_dim)
+        # state.col_feature.shape  : (B, machine_cnt, col_feat_dim)
+        # state.edge_feature.shape : (B, job_cnt, machine_cnt, edge_feat_dim)
+        # state.edge_mask.shape    : (B, machine_cnt, job_cnt)
+        # state.finished.shape     : (B,) bool
         # sample=False → Gumbel-Max/argmax 스킵, edge_selected=None 반환 (SIL replay 용).
         # Returns:
-        #   edge_selected : (BP,) long — softmax sample 또는 argmax index ∈ [0, machine_cnt * job_cnt). sample=False 면 None.
-        #   flat_probs    : (BP, machine_cnt * job_cnt) — joint distribution. caller 가
+        #   edge_selected : (B,) long — softmax sample 또는 argmax index ∈ [0, machine_cnt * job_cnt). sample=False 면 None.
+        #   flat_probs    : (B, machine_cnt * job_cnt) — joint distribution. caller 가
         #                   gather(action) + finished masking 책임 (SIL replay 포함).
         batch_size = state.BATCH_IDX.size(0)
         pomo_size = state.BATCH_IDX.size(1)
-        BP = batch_size * pomo_size
+        B = batch_size * pomo_size
 
-        lam_emb = self.W_lam(state.lambdas.view(-1, 1))  # (BP, embedding_dim) — initial λ embedding
+        lam_emb = self.W_lam(state.lambdas.view(-1, 1))  # (B, embedding_dim) — initial λ embedding
         row_emb = self.Wr(state.row_feature)
         col_emb = self.Wc(state.col_feature)
         # encoder 가 λ 도 layer 마다 업데이트 (POCCO eq 9, 12) → encoded_lam 반환
-        # state.edge_mask 는 (BP, machine_cnt, job_cnt) ninf 스타일 → encoder 의 (J, M) 방향에 맞춰 transpose.
+        # state.edge_mask 는 (B, machine_cnt, job_cnt) ninf 스타일 → encoder 의 (J, M) 방향에 맞춰 transpose.
         edge_mask_jm = state.edge_mask.transpose(1, 2)
         self.encoded_row, self.encoded_col, encoded_lam = self.encoder(
             row_emb, col_emb, state.edge_feature, edge_mask=edge_mask_jm, lam_emb=lam_emb)
-        # encoded_row.shape: (BP, job_cnt, embedding)
-        # encoded_col.shape: (BP, machine_cnt, embedding)
-        # encoded_lam.shape: (BP, embedding)  — h^L_λ, 모든 instance feature 가 attend 된 동적 신호
+        # encoded_row.shape: (B, job_cnt, embedding)
+        # encoded_col.shape: (B, machine_cnt, embedding)
+        # encoded_lam.shape: (B, embedding)  — h^L_λ, 모든 instance feature 가 attend 된 동적 신호
 
         # decoder: MHA K/V 에 λ 한 슬롯 추가 (POCCO eq.13) + CCO gate 입력으로 encoded λ 전달
         # (paper Fig.1: per-subproblem 라우팅). set_kv 가 lam_emb 도 저장해 forward 에서 사용.
         self.decoder.set_kv(self.encoded_row, lam_emb=encoded_lam)
         all_edge_probs = self.decoder(self.encoded_col, ninf_mask=state.edge_mask)
-        # shape: (BP, machine_cnt, job_cnt) — 전 (machine, job) 그리드 joint 분포
+        # shape: (B, machine_cnt, job_cnt) — 전 (machine, job) 그리드 joint 분포
 
         # (machine × job_cnt) 을 단일 edge 차원으로 평탄화
-        flat_probs = all_edge_probs.reshape(BP, -1)
-        # shape: (BP, edge_cnt)  where edge_cnt = machine_cnt * job_cnt
+        flat_probs = all_edge_probs.reshape(B, -1)
+        # shape: (B, edge_cnt)  where edge_cnt = machine_cnt * job_cnt
 
         # SIL replay 처럼 action 이 미리 정해진 호출은 sample=False 로 Gumbel-Max/argmax 스킵.
         if not sample:
