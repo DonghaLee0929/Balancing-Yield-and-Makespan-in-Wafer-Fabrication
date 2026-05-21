@@ -300,6 +300,9 @@ class HFSPGraphEnv:
         op_end_rem = (self.op_end.float() - op_anchor).clamp(min=0.0)
         per_op_rem = torch.where(self.op_assigned, op_end_rem, self.per_op_min_proc)
         remaining_proc = per_op_rem.view(B, J, S).sum(dim=2)
+        # 전 stage 완료(is_done) job 은 둘 결정도 없고 edge 도 전부 마스킹되므로 잔여 0 강제.
+        # (op_end > min_est 인 늦게 끝난 job 이 frontier 기준 양수 잔여를 남기는 leak 차단.)
+        remaining_proc = torch.where(is_done, torch.zeros_like(remaining_proc), remaining_proc)
 
         self.row_pool = {
             'active_stage':      active_stage_feat,

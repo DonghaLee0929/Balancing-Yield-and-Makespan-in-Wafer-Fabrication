@@ -287,11 +287,19 @@ def build_model_state(env: HFSPGraphEnv,
                                         else torch.zeros(BP, J, M, dtype=torch.float32, device=device))
     edge_feat = torch.stack([edge_pool[n] for n in names['edge']], dim=-1)
     # 채널별 마스킹:
-    #  - proc_time : 모든 (j, m) 에서 실제 처리시간 유지 (과거/현재/미래 stage 전부) → 마스킹 제외.
+    #  - proc_time : 과거 stage(이미 완료) 엣지만 -1 패딩, 현재+미래 stage 는 실제 처리시간 유지 (look-ahead).
     #  - 그 외(est/eft/quality_zscore) : 실제 선택 가능한 엣지(active op stage = valid_edge_3d) 외엔 -1 패딩.
+    #  - done job(전 stage 완료) : active op 이 마지막 stage 로 clamp 돼 valid_edge_3d 가 남으므로,
+    #    엣지 전체가 무의미 → 모든 채널 -1 로 강제.
     #    (모두 정상값이 >=0 이라 -1 은 깨끗한 sentinel. feasibility 는 edge_mask 가 따로 처리.)
-    mask_inv = (~env.valid_edge_3d).unsqueeze(-1).expand(-1, -1, -1, edge_feat.size(-1)).clone()
-    mask_inv[..., names['edge'].index('proc_time')] = False
+    S = env.num_stages
+    pt_idx = names['edge'].index('proc_time')
+    active_depth = env.op_assigned.view(BP, J, S).sum(dim=2)                     # (BP, J) ∈ [0, S] 완료 stage 수
+    past_stage   = env.machine_stage.view(1, 1, M) < active_depth.unsqueeze(-1)  # (BP, J, M) 과거 stage 머신
+    job_done     = (active_depth == S).unsqueeze(-1)                             # (BP, J, 1) 전 stage 완료
+    base_inv = (~env.valid_edge_3d) | job_done                                   # (BP, J, M) done job → 전 머신 무효
+    mask_inv = base_inv.unsqueeze(-1).expand(-1, -1, -1, edge_feat.size(-1)).clone()
+    mask_inv[..., pt_idx] = past_stage   # done job 은 past_stage 도 전 머신 True → proc_time 도 -1 일관
     edge_feat.masked_fill_(mask_inv, -1.0)
 
     if lambdas_t is None:
