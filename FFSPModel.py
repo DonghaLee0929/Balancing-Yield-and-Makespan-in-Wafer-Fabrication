@@ -43,9 +43,10 @@ class FFSPModel(nn.Module):
         embedding_dim = self.model_params['embedding_dim']
         self.Wr = nn.Linear(row_feature_dim, embedding_dim, bias=True)
         self.Wc = nn.Linear(col_feature_dim, embedding_dim, bias=True)
-        # λ (preference scalar) → embedding_dim. POCCO eq.(8) FiLM 신호로 encoder/decoder 양쪽 사용.
+        # 가중치 벡터 λ=(λ₁,λ₂) (simplex, Σ=1) → embedding_dim. POCCO eq.(7) W_λ∈R^{d×κ}.
+        # κ=2 목적이라 입력 2차원 (makespan·quality 두 weight). FiLM(eq.8) 신호로 encoder/decoder 양쪽 사용.
         self.W_lam = nn.Sequential(
-            nn.Linear(1, embedding_dim),
+            nn.Linear(2, embedding_dim),
             nn.ReLU(),
             nn.Linear(embedding_dim, embedding_dim),
         )
@@ -74,7 +75,10 @@ class FFSPModel(nn.Module):
         pomo_size = state.BATCH_IDX.size(1)
         B = batch_size * pomo_size
 
-        lam_emb = self.W_lam(state.lambdas.view(-1, 1))  # (B, embedding_dim) — initial λ embedding
+        # λ 스칼라(=makespan weight) → simplex 벡터 (λ, 1-λ) 로 확장해 양 목적 weight 를 명시 입력 (eq.7).
+        lam1 = state.lambdas.reshape(-1, 1)
+        lam_vec = torch.cat([lam1, 1.0 - lam1], dim=-1)  # (B, 2)
+        lam_emb = self.W_lam(lam_vec)  # (B, embedding_dim) — initial λ embedding
         row_emb = self.Wr(state.row_feature)
         col_emb = self.Wc(state.col_feature)
         # encoder 가 λ 도 layer 마다 업데이트 (POCCO eq 9, 12) → encoded_lam 반환
@@ -86,8 +90,8 @@ class FFSPModel(nn.Module):
         # encoded_col.shape: (B, machine_cnt, embedding)
         # encoded_lam.shape: (B, embedding)  — h^L_λ, 모든 instance feature 가 attend 된 동적 신호
 
-        # decoder: MHA K/V 에 λ 한 슬롯 추가 (POCCO eq.13) + CCO gate 입력으로 encoded λ 전달
-        # (paper Fig.1: per-subproblem 라우팅). set_kv 가 lam_emb 도 저장해 forward 에서 사용.
+        # decoder: MHA K/V 에 λ 한 슬롯 추가 (POCCO eq.13). CCO 는 h_c 자체로 라우팅(eq.2)하므로
+        # λ 는 여기서 K/V pseudo-node 로만 들어간다.
         self.decoder.set_kv(self.encoded_row, lam_emb=encoded_lam)
         all_edge_probs = self.decoder(self.encoded_col, ninf_mask=state.edge_mask)
         # shape: (B, machine_cnt, job_cnt) — 전 (machine, job) 그리드 joint 분포
@@ -174,13 +178,10 @@ class EncodingBlock(nn.Module):
         head_num = self.model_params['head_num']
         qkv_dim = self.model_params['qkv_dim']
 
-        # POCCO eq.(8) FiLM conditioner: γ = 1 + W_γ(λ),  β = W_β(λ).
-        # small-normal init (std=0.01): init 시점부터 λ 가 미세하게 출력에 흘러가
-        # gradient self-amplification 경로가 깨어있도록. 
-        self.W_gamma = nn.Linear(embedding_dim, embedding_dim)
-        self.W_beta  = nn.Linear(embedding_dim, embedding_dim)
-        nn.init.normal_(self.W_gamma.weight, std=0.01); nn.init.zeros_(self.W_gamma.bias)
-        nn.init.normal_(self.W_beta.weight,  std=0.01); nn.init.zeros_(self.W_beta.bias)
+        # POCCO eq.(8) FiLM conditioner (literal): γ = W_γ(λ),  β = W_β(λ).
+        # 순수 선형(bias 없음), 기본 init — 논문 식 그대로 (+1 / small-init 트릭 미사용).
+        self.W_gamma = nn.Linear(embedding_dim, embedding_dim, bias=False)
+        self.W_beta  = nn.Linear(embedding_dim, embedding_dim, bias=False)
 
         self.Wq = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
         self.Wk = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
@@ -208,8 +209,8 @@ class EncodingBlock(nn.Module):
         #   - residual base 는 원본 (nodes: h^{l-1}_i, λ: h^{l-1}_λ).
         # 단일 MHA 호출로 (nodes + λ) 동시 업데이트 → 끝에서 분리해 반환.
         if lam_emb is not None:
-            gamma = 1.0 + self.W_gamma(lam_emb).unsqueeze(1)   # (batch, 1, embedding)
-            beta  = self.W_beta(lam_emb).unsqueeze(1)
+            gamma = self.W_gamma(lam_emb).unsqueeze(1)          # (batch, 1, embedding) — POCCO eq.(8) γ=W_γ(λ)
+            beta  = self.W_beta(lam_emb).unsqueeze(1)            # β=W_β(λ)
             row_cond = gamma * row_emb + beta
             col_cond = gamma * col_emb + beta
             lam_token = lam_emb.unsqueeze(1)                    # (batch, 1, embedding)
@@ -267,7 +268,9 @@ class FFSP_Decoder(nn.Module):
         self.Wv = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
 
         self.multi_head_combine = nn.Linear(head_num * qkv_dim, embedding_dim)
-        # POCCO CCO block — λ_emb 으로 게이팅하는 per-subproblem expert routing
+        # POCCO eq.(14) compatibility 의 single-head key 투영 W^K (MHA 의 Wk 와 별개 행렬).
+        self.W_single_key = nn.Linear(embedding_dim, embedding_dim, bias=False)
+        # POCCO CCO block — glimpse h_c 자체로 라우팅하는 expert block (paper Eq.2)
         self.cco_block = CCOBlock(**self.model_params)
 
         self.k = None  # saved key, for multi-head attention
@@ -285,9 +288,8 @@ class FFSP_Decoder(nn.Module):
         self.k = reshape_by_heads(self.Wk(kv_in), head_num=head_num)
         self.v = reshape_by_heads(self.Wv(kv_in), head_num=head_num)
         # shape: (batch, head_num, job_cnt(+1), qkv_dim)
-        self.single_head_key = encoded_jobs.transpose(1, 2)
-        # shape: (batch, embedding, job_cnt)  — λ 제외
-        self.lam_emb = lam_emb  # CCO gating 입력으로 forward 에서 사용
+        self.single_head_key = self.W_single_key(encoded_jobs).transpose(1, 2)
+        # shape: (batch, embedding, job_cnt)  — POCCO eq.(14) 의 W^K h_i. λ 제외.
 
     def forward(self, encoded_machines, ninf_mask):
         # encoded_machines.shape: (batch, machine_cnt, embedding)  ← 모든 기계를 쿼리로
@@ -318,10 +320,10 @@ class FFSP_Decoder(nn.Module):
         mh_atten_out = self.multi_head_combine(out_concat)
         # shape: (batch, machine_cnt, embedding)
 
-        # POCCO CCO routing — paper Fig.1 / eq.2 의 per-subproblem 라우팅.
-        # gate_input = encoded λ 벡터 → 같은 (batch, λ) 의 모든 머신 토큰이 동일 expert 조합으로
-        # 처리됨 → λ 다를수록 다른 computation path → policy specialization.
-        mh_atten_out = self.cco_block(mh_atten_out, gate_input=self.lam_emb)
+        # POCCO CCO block (paper Eq.2): g_c = CCO(h_c), h_c = mh_atten_out.
+        # gate G(h_c)=Softmax(TopK(h_c·W_G)) 와 experts E_j(h_c) 모두 h_c 를 입력으로 사용.
+        # 머신별 context h_c 가 각자 독립적으로 라우팅됨 (Eq.2 를 머신 토큰에 그대로 적용).
+        mh_atten_out = self.cco_block(mh_atten_out)
 
         #  Single-Head Attention, for probability calculation
         #######################################################

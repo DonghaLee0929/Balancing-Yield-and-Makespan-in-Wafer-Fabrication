@@ -435,7 +435,9 @@ def sil_pomo_rollout(env: HFSPGraphEnv, model: FFSPModel,
                 env, batch_idx_full, B, P, device,
                 wafer_quality_t=wafer_q_bp, lambdas_t=lam_bp, quality_helper=quality_helper,
             )
-            edge_selected, _ = model(state)
+            edge_selected, flat_probs = model(state)
+            if recorder is not None:
+                recorder.accumulate_entropy(flat_probs)
 
             # EST override — 마지막 P 슬롯의 (machine, job) edge_selected 를 env-edge 가 아닌
             # model action 공간(edge_selected = machine_idx*num_jobs + job_idx)으로 환산해 덮어씀.

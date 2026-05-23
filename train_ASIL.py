@@ -69,6 +69,7 @@ def default_model_params(embedding_dim=128, head_num=8, qkv_dim=16,
         # CCO block
         'cco_num_ff_experts': 4,        # 4개의 FF 전문가
         'cco_top_k': 2,                 # 상위 2개의 전문가에게 라우팅
+        'cco_gate_input_dim': 2 * embedding_dim,  # gate 입력 = [h_c ; λ_emb] concat (per-token 라우팅)
     }
 
 # =====================================================
@@ -212,7 +213,8 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
     )
     eval_lookup_t = make_env_edge_lookup(eval_env).to(device)
 
-    # WandB recorder — logs loss / makespan / quality / grad norms / feature saliency / Pareto.
+    # WandB recorder — logs loss / makespan / quality / grad norms / feature saliency /
+    # policy entropy / CCO MoE routing health / Pareto.
     # wandb_enabled=False 면 no-op stub.
     rec = DataRecorder(
         project=wandb_project, run_name=wandb_run_name, enabled=wandb_enabled,
@@ -302,6 +304,7 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
             loss_unscaled = loss_micro.detach() * n_accum
             rec.log_step(loss_unscaled, G_ms, G_q, r_bp, lambdas_b, log_prob_sum_best, weight)
             rec.collect_saliency()
+            rec.collect_entropy()
 
             # ── Logging stats — accumulate on GPU, sync once at epoch end ──
             ms_bp = (-G_ms).view(B, P)
@@ -314,6 +317,7 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
 
         # 누적된 grad 로 step 1번. log_gradients 는 clip 직전 = 누적 완료 시점에서 측정.
         rec.log_gradients(model)
+        rec.log_moe(model)   # CCO 라우팅 헬스 — epoch 동안 Phase-2 forward 누적분 pop
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
         optimizer.step()
         scheduler.step()
@@ -374,6 +378,19 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
                            nd_mean, scatter_path,
                            d_ms=d_ms, d_q=d_q)
 
+            # ── Gantt of the best (min-makespan) schedule from this λ-sweep ──
+            # eval_pareto 의 마지막 rollout 상태가 eval_env 에 그대로 남아 있음.
+            # ms_lam (L,K) 의 flat argmin = row-major batch idx (lam_idx*K + k) → 그 원소를 렌더.
+            # argmin 이므로 makespan 최소 = 그림 폭(figsize ∝ makespan)도 최소.
+            best_b = int(ms_lam.argmin().item())
+            gantt_path = f"train_results/gantt_epoch_{epoch}.png"
+            eval_env.render_schedule(
+                batch_idx=best_b, save_path=gantt_path,
+                title=f"epoch {epoch} best",
+            )
+            if os.path.exists(gantt_path):   # render_schedule 은 미배치 시 early-return
+                rec.log_gantt(gantt_path)
+
             if hv_mean > best_eval:
                 best_eval = hv_mean
                 log_msg += " ← best"
@@ -395,6 +412,10 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
             log_msg += f" ({eval_elapsed:5.2f}s)"
             print(log_msg)
 
+        # Reward 정규화 anchor — 현재 고정값이라 flat line. ms/mean·q/mean 수렴을
+        # m_min/m_max·q_min/q_max 경계와 같은 차트에서 비교하기 위한 reference.
+        # 인자 순서 (m_min, m_max, q_min, q_max) ← (best/낮은 ms, worst/높은 ms, worst/낮은 q, best/높은 q).
+        rec.log_anchors(hv_m_best, hv_m_ref, hv_q_ref, hv_q_best)
         rec.log_epoch(train_elapsed, cur_lr)
         rec.flush(step=epoch)
 

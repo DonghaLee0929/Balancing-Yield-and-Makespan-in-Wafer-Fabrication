@@ -243,10 +243,10 @@ class Mixed_MultiHeadCrossAttention(nn.Module):
 
 class CCOBlock(nn.Module):
     """
-    Conditional Computation block (POCCO, NeurIPS 2025).
-    각 입력 토큰을 sparse Top-k gate 를 통해 {FF experts, ID expert} 로 라우팅한 뒤
-    residual + InstanceNorm 을 적용한다.
-        CCO(h) = IN( sum_j G(h)_j · E_j(h) + h ),  G = Softmax(TopK(h · W_G))
+    Conditional Computation block (POCCO, NeurIPS 2025) — 논문 Eq.(2) 충실 구현.
+        CCO(h_c) = IN( Σ_j G(h_c)_j · E_j(h_c) + h_c ),  G(h_c) = Softmax(TopK(h_c · W_G))
+    gate 와 m 개 FF expert 모두 입력 h_c 를 그대로 사용하고, ID expert E_{m+1}(h_c)=h_c
+    (parameter-free identity) 한 개를 더한다. 정규화(IN)는 residual 합 뒤에 마지막에 적용.
     """
     def __init__(self, **model_params):
         super().__init__()
@@ -256,7 +256,7 @@ class CCOBlock(nn.Module):
         self.top_k = model_params.get('cco_top_k', 2)
         num_experts = self.num_ff_experts + 1  # +1: parameter-free ID expert
 
-        # FF experts: 모든 expert 를 stack 해 einsum 으로 한 번에 계산
+        # m 개 FF expert: 모든 expert 를 stack 해 einsum 으로 한 번에 계산 (각자 독립 파라미터)
         self.W1 = nn.Parameter(torch.empty(self.num_ff_experts, embedding_dim, ff_hidden_dim))
         self.b1 = nn.Parameter(torch.zeros(self.num_ff_experts, ff_hidden_dim))
         self.W2 = nn.Parameter(torch.empty(self.num_ff_experts, ff_hidden_dim, embedding_dim))
@@ -264,41 +264,64 @@ class CCOBlock(nn.Module):
         nn.init.xavier_uniform_(self.W1)
         nn.init.xavier_uniform_(self.W2)
 
+        # router W_G ∈ R^{d×(m+1)} (paper Eq.2 / Appendix C.3): 입력은 h_c (embedding_dim).
         self.gate = nn.Linear(embedding_dim, num_experts, bias=False)
         self.norm = nn.InstanceNorm1d(embedding_dim, affine=True, track_running_stats=False)
 
-    def forward(self, x, gate_input):
-        # x.shape:          (batch, problem, embedding)
-        # gate_input.shape: (batch, embedding) — per-subproblem 라우팅. 한 배치 요소 안의
-        #                   모든 token 이 동일 expert 조합을 공유 → sparse dispatch 로
-        #                   선택된 top_k expert weight 만 gather 해서 FF 연산.
-        x_norm = self.norm(x.transpose(1, 2)).transpose(1, 2)
+        # ── 라우팅 헬스 누적 버퍼 (train-mode forward 에서만 갱신) ──
+        # expert collapse / 게이트 경직 감시용. DataRecorder.log_moe 가 epoch 마다 pop.
+        # persistent=False → state_dict(체크포인트)에 포함되지 않음.
+        self.register_buffer('_route_mass', torch.zeros(num_experts), persistent=False)
+        self.register_buffer('_route_ent_sum', torch.zeros(()), persistent=False)
+        self.register_buffer('_route_count', torch.zeros(()), persistent=False)
 
-        topk_logits, topk_idx = torch.topk(self.gate(gate_input), self.top_k, dim=-1)
-        topk_gates = F.softmax(topk_logits, dim=-1)
-        # shape: (batch, top_k)
+    def forward(self, x):
+        # x = h_c.shape: (batch, problem, embedding)  — MHA 출력 context vector.
+        # gate 와 expert 모두 h_c 를 입력으로 사용 (paper Eq.2). 머신별 context 가 독립 라우팅됨.
+        # num_ff_experts 가 작아 sparse gather 대신 모든 expert 를 dense 계산 후 top_k gate 만 가중.
+        gate_logits = self.gate(x)                             # (batch, problem, num_experts) = h_c · W_G
+        topk_logits, topk_idx = torch.topk(gate_logits, self.top_k, dim=-1)
+        # autocast(bf16) 하에서 softmax 는 fp32 로 승격되므로 gate_logits(bf16) 와 dtype 이 어긋남 →
+        # scatter dtype 일치를 위해 activation dtype 으로 되돌림.
+        topk_gates = F.softmax(topk_logits, dim=-1).to(gate_logits.dtype)
+        # 선택된 top_k 슬롯에만 softmax gate, 나머지 expert 엔 0 → Softmax(TopK(·)) 와 동일.
+        full_gates = torch.zeros_like(gate_logits).scatter(-1, topk_idx, topk_gates)
 
-        # ID expert (index = num_ff_experts) 는 파라미터 없음 → clamp 후 해당 슬롯의
-        # FF 출력을 x_norm 으로 덮어쓴다.
-        is_id = (topk_idx == self.num_ff_experts)
-        ff_idx = topk_idx.clamp(max=self.num_ff_experts - 1)
+        if self.training:
+            # 라우팅 통계 누적 (no-grad, sync 없음). model.eval() 인 Phase-1 sampling/eval 은
+            # 제외되고, model.train() 인 Phase-2 grad-replay(실제 학습 대상) 만 잡힌다.
+            with torch.no_grad():
+                g = full_gates.detach().float()                      # (batch, problem, num_experts)
+                self._route_mass += g.sum(dim=(0, 1))                # expert 별 게이트 질량 누적
+                ent = -(g.clamp_min(1e-12).log() * g).sum(dim=-1)    # (batch, problem) per-token 엔트로피
+                self._route_ent_sum += ent.sum()
+                self._route_count += g.shape[0] * g.shape[1]
 
-        W1_sel = self.W1[ff_idx]  # (batch, top_k, embedding, ff_hidden)
-        b1_sel = self.b1[ff_idx]  # (batch, top_k, ff_hidden)
-        W2_sel = self.W2[ff_idx]  # (batch, top_k, ff_hidden, embedding)
-        b2_sel = self.b2[ff_idx]  # (batch, top_k, embedding)
+        # FF experts E_1..E_m 를 h_c 에 적용. b1/b2 는 trailing dim 으로 broadcast.
+        ff_hidden = F.relu(torch.einsum('bpe,nef->bpnf', x, self.W1) + self.b1)
+        ff_all = torch.einsum('bpnf,nfe->bpne', ff_hidden, self.W2) + self.b2
+        # ID expert E_{m+1}(h_c) = h_c (parameter-free identity) 를 마지막 슬롯에 붙임.
+        expert_out = torch.cat([ff_all, x.unsqueeze(2)], dim=2)  # (batch, problem, num_experts, embedding)
 
-        ff_hidden = F.relu(torch.einsum('bpe,bkef->bpkf', x_norm, W1_sel) + b1_sel.unsqueeze(1))
-        ff_sel = torch.einsum('bpkf,bkfe->bpke', ff_hidden, W2_sel) + b2_sel.unsqueeze(1)
-        # shape: (batch, problem, top_k, embedding)
+        combined = (expert_out * full_gates.unsqueeze(-1)).sum(dim=2)  # Σ_j G_j E_j(h_c)
+        # residual + h_c 뒤에 InstanceNorm — paper Eq.2 의 IN(... + h_c) (post-norm).
+        out = combined + x
+        return self.norm(out.transpose(1, 2)).transpose(1, 2)
 
-        ff_sel = torch.where(is_id[:, None, :, None], x_norm.unsqueeze(2), ff_sel)
+    def pop_routing_stats(self):
+        """누적 라우팅 통계 반환 + 리셋. train-mode forward 가 없던 epoch 이면 None.
+        load[j] = expert j 로 간 평균 게이트 질량 (Σ_j load = 1), 마지막 슬롯이 ID expert.
+        load_max↑ 또는 entropy↓ → 소수 expert 로 쏠림(collapse) 신호."""
+        if float(self._route_count) == 0.0:
+            return None
+        n = self._route_count.clamp_min(1.0)
+        load = (self._route_mass / n).tolist()
+        entropy = float(self._route_ent_sum / n)
+        self._route_mass.zero_()
+        self._route_ent_sum.zero_()
+        self._route_count.zero_()
+        return {'load': load, 'entropy': entropy}
 
-        combined = (ff_sel * topk_gates[:, None, :, None]).sum(dim=2)
-        # shape: (batch, problem, embedding)
-
-        return combined + x
-    
 
 class InstanceNormalization(nn.Module):
     def __init__(self, **model_params):

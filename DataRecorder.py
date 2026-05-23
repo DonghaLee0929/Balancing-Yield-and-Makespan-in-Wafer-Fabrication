@@ -31,6 +31,8 @@ class DataRecorder:
         self._buf: dict = {}       # one-shot (eval/, gantt, time/, lr 등)
         self._acc: dict = {}       # {key: (sum, count)} — flush 시 평균
         self._watched: list = []   # [(rf, cf, ef), ...]
+        self._ent_sum = None       # policy entropy GPU 누적 (per-step sync 회피)
+        self._ent_n = 0
         if self.enabled:
             wandb.init(project=project, name=run_name, config=config)
 
@@ -186,14 +188,52 @@ class DataRecorder:
         total = torch.linalg.vector_norm(torch.stack(per_param_norms)).item()
         self._add('grad/global_norm', total)
 
-    def log_eval(self, ms_mean, ms_min, ms_std):
+    def accumulate_entropy(self, probs):
+        """Phase-1 sampling 의 step별 정책 엔트로피를 GPU 에 누적 (sync 없음).
+
+        probs: (BP, A) joint (machine×job) softmax. 엔트로피가 떨어지면 P 샘플이 같은
+        trajectory 로 수렴 → POMO baseline std→0 (weight/zero_frac 의 상류 원인).
+        collect_entropy 가 micro-rollout 마다 1회 sync 로 평균을 기록.
+        """
         if not self.enabled:
             return
-        self._buf.update({
-            'eval/ms_mean': float(ms_mean),
-            'eval/ms_min': float(ms_min),
-            'eval/ms_std': float(ms_std),
-        })
+        with torch.no_grad():
+            p = probs.float()
+            ent = -(p.clamp_min(1e-12).log() * p).sum(dim=-1).mean()
+        self._ent_sum = ent if self._ent_sum is None else self._ent_sum + ent
+        self._ent_n += 1
+
+    def collect_entropy(self):
+        """micro-rollout 마다 호출 — 누적된 step 엔트로피 평균을 1회 sync 로 기록."""
+        if not self.enabled or self._ent_n == 0:
+            return
+        self._add('policy/entropy', (self._ent_sum / self._ent_n).item())
+        self._ent_sum, self._ent_n = None, 0
+
+    def log_moe(self, model):
+        """CCO MoE 라우팅 헬스 — epoch 당 1회 (clip 직전, log_gradients 옆).
+
+        CCOBlock 이 train-mode forward(=Phase-2 grad-replay)마다 게이트 질량·엔트로피를
+        누적 → 여기서 pop. load_max↑ 또는 gate_entropy↓ → 라우팅이 소수 expert 로
+        쏠림(expert collapse). id_expert_frac↑ → FF expert 들이 학습에 기여 안 함.
+        """
+        if not self.enabled:
+            return
+        from FFSPModel_SUB import CCOBlock
+        for m in model.modules():
+            if not isinstance(m, CCOBlock):
+                continue
+            stats = m.pop_routing_stats()
+            if stats is None:
+                return
+            load = stats['load']
+            for j, v in enumerate(load):
+                tag = 'id' if j == len(load) - 1 else f'e{j}'
+                self._add(f'moe/load_{tag}', v)
+            self._add('moe/load_max', max(load))
+            self._add('moe/gate_entropy', stats['entropy'])
+            self._add('moe/id_expert_frac', load[-1])
+            return  # 단일 CCO 블록 가정
 
     def log_gantt(self, path):
         if not self.enabled:
