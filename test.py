@@ -67,6 +67,31 @@ def compute_pareto_front(makespan: np.ndarray, yld: np.ndarray) -> np.ndarray:
     return np.asarray(front, dtype=np.int64)
 
 
+def hypervolume(ms: np.ndarray, yld: np.ndarray,
+                m_ref: float, q_ref: float) -> tuple[float, np.ndarray]:
+    """ref(worst corner) = (m_ref, q_ref). 비지배 점이 ref 까지 지배하는 면적 + 사용된 front idx.
+
+    min makespan / max yield → 비지배 front 는 makespan↑ 일수록 yield↑.
+    HV = Σ_i (m_{i+1} − m_i)·(y_i − q_ref),  m_{last+1} = m_ref.
+    ⚠ nsga2.py 의 동명 함수와 1:1 동일 — 모델·NSGA-II HV 를 같은 정의로 비교하기 위함.
+    """
+    mask = (ms < m_ref) & (yld > q_ref)
+    if not mask.any():
+        return 0.0, np.empty(0, dtype=np.int64)
+    idx_in = np.where(mask)[0]
+    m_in, y_in = ms[idx_in], yld[idx_in]
+    order = np.lexsort((-y_in, m_in))            # makespan asc, tie → yield desc
+    fm, fy, fidx, best = [], [], [], -np.inf
+    for k in order:
+        if y_in[k] > best:                       # strict → 동일 yield(더 큰 makespan) 은 지배됨
+            fm.append(m_in[k]); fy.append(y_in[k]); fidx.append(idx_in[k]); best = y_in[k]
+    hv = 0.0
+    for i in range(len(fm)):
+        next_m = fm[i + 1] if i + 1 < len(fm) else m_ref
+        hv += (next_m - fm[i]) * (fy[i] - q_ref)
+    return float(hv), np.asarray(fidx, dtype=np.int64)
+
+
 # =====================================================
 # Path-percentile scorer
 # =====================================================
@@ -456,6 +481,15 @@ def evaluate_pareto(
           f"mean={plot_yld.mean():{fmt}}  "
           f"min={plot_yld.min():{fmt}}  max={plot_yld.max():{fmt}}")
 
+    # ── Hypervolume (nsga2.py 와 동일 정의·동일 anchor → 직접 비교 가능) ──
+    hv_raw, _ = hypervolume(plot_ms.astype(np.float64), plot_yld.astype(np.float64),
+                            hv_m_ref, hv_q_ref)
+    hv_box = (hv_m_ref - hv_m_best) * (hv_q_best - hv_q_ref)
+    hv_norm = hv_raw / hv_box if hv_box > 0 else float('nan')
+    print(f"[eval] HV_raw  = {hv_raw:.4f}   (ref=({hv_m_ref:.0f}, {hv_q_ref:{fmt}}))")
+    print(f"[eval] HV_norm = {hv_norm:.4f}  (anchor box [{hv_m_best:.0f},{hv_m_ref:.0f}]"
+          f"×[{hv_q_ref:{fmt}},{hv_q_best:{fmt}}])")
+
     title_mode = 'x1' if greedy else f'x{samples}'
     if N_runs == 1:
         run_tag = f'paths_{paths_idx_list[0]}'
@@ -485,44 +519,44 @@ def evaluate_pareto(
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument('--ckpt',        type=str, default='checkpoints/saved_J25_baseline_0519.pt')
+    p.add_argument('--ckpt',        type=str, default='checkpoints/saved_J25_new_baseline.pt')
     p.add_argument('--method',      type=str, default='model',
                    choices=['model', 'est'],
                    help="스케줄링 정책. 'model' = 학습된 λ-conditioned 모델, "
                         "'est' = EST 휴리스틱 baseline (λ 무관, ckpt 불필요). "
                         "yield 계산(raw/percentile)은 두 경우 동일.")
-    p.add_argument('--num_jobs',    type=int, default=15)
+    p.add_argument('--num_jobs',    type=int, default=25)
     p.add_argument('--machines',    type=str, default='5,3,7,3,5,7')
-    p.add_argument('--yield_mode',  type=str, default='raw',
+    p.add_argument('--yield_mode',  type=str, default='percentile',
                    choices=['raw', 'percentile'],
                    help="둘 다 ground-truth (CSV quality factor 기반, 예측 모델 미사용). "
                         "'raw' = quality factor 의 path 곱 × 초기 품질 (job 평균), "
                         "'percentile' = 그 path 곱의 전체 분포 대비 백분위 (job 평균)")
     p.add_argument('--num_lambdas',        type=int, default=32,
                    help='λ grid 크기. linspace(0,1,N) 으로 sweep.')
-    p.add_argument('--samples', type=int, default=1,
+    p.add_argument('--samples', type=int, default=8,
                    help='λ 당 trajectory 수. 1 = greedy, >1 = stochastic sampling.')
     p.add_argument('--paths_idx',   type=str, default='1~10',
                    help="historical_paths 인덱스. 단일('5') / range('1~10') / list('1,3,5'). "
                         "여러 개면 각 idx 별 1회 실험 후 (makespan, yield) 평균으로 Pareto 그림. "
                         "모델/풀 : quality_results/Q_{q_idx}/paths_{paths_idx}/{best_hb_model.zip, wafer_quality.json}. "
                         "입력 CSV : quality_data/Q_{q_idx}/historical_paths_{paths_idx}.csv")
-    p.add_argument('--single_view', type=str, default='all',
+    p.add_argument('--single_view', type=str, default='best',
                    choices=['best', 'all'],
                    help="paths_idx 가 1개일 때만 적용: "
                         "'best' = 람다별 λ-가중 정규화 점수 argmax 1점, "
                         "'all'  = 모든 (λ, sample) 점 표시. "
                         "paths_idx 가 여러 개면 항상 'best' 동작.")
-    p.add_argument('--p_idx',       type=int, choices=[1, 2, 3], default=1,
+    p.add_argument('--p_idx',       type=int, choices=[1, 2, 3], default=3,
                    help="proc_time 인스턴스 인덱스 → quality_data/P_{p_idx}.csv")
-    p.add_argument('--q_idx',       type=int, choices=[1, 2, 3], default=1,
+    p.add_argument('--q_idx',       type=int, choices=[1, 2, 3], default=3,
                    help="quality 시나리오 인덱스 (Q 폴더)")
-    p.add_argument('--xlim', type=str, default='30,111,20',
+    p.add_argument('--xlim', type=str, default='100,500,100',
                    help="x축 (makespan) 범위. 'lo,hi' 또는 'lo,hi,step' "
-                        "(예: '40,170,30' → tick 40,70,100,130,160; xlim=170).")
-    p.add_argument('--ylim', type=str, default='40,101,10',
+                        "(예: '40,160,30' → tick 40,70,100,130,160; xlim=160).")
+    p.add_argument('--ylim', type=str, default='0.50,0.85,0.05',
                    help="y축 (yield/percentile) 범위. 'lo,hi' 또는 'lo,hi,step'.")
-    p.add_argument('--wafer_quality', type=str, default='0.90,0.90',
+    p.add_argument('--wafer_quality', type=str, default='0.99,1.00',
                    help="초기 웨이퍼 품질 U[lo,hi] 샘플 범위. 'lo,hi' (예: '0.99,1.00'). "
                         "lo==hi 면 모든 job 이 상수 품질 (예: '1.00,1.00'). "
                         "raw yield 엔 직접 반영, percentile 모드에선 모델 입력에만 반영.")
@@ -550,7 +584,9 @@ if __name__ == "__main__":
             return (parts[0], parts[1]), None
         if len(parts) == 3:
             lo, hi, step = parts
-            ticks = np.arange(lo, hi, step)   # hi 는 tick 으로 안 찍음 (xlim 만 hi)
+            ticks = np.arange(lo, hi + step / 2, step)   # hi 도 tick 에 포함 (step/2 여유로 부동소수 오차 흡수)
+            if ticks.size == 0 or not np.isclose(ticks[-1], hi):
+                ticks = np.append(ticks, hi)             # step 으로 안 나눠떨어져도 끝점 보장
             return (lo, hi), ticks
         raise ValueError(f"axis must be 'lo,hi' or 'lo,hi,step', got: {s!r}")
 
