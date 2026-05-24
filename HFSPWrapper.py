@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from hummingbird.ml import load
 
-from HFSPGraphEnv import HFSPGraphEnv, sample_est_action
+from HFSPGraphEnv import HFSPGraphEnv
 from FFSPModel import FFSPModel
 
 # =====================================================
@@ -388,12 +388,7 @@ def sil_pomo_rollout(env: HFSPGraphEnv, model: FFSPModel,
                      quality_helper: QualityHelper,
                      m_best: float, m_worst: float,
                      q_best: float, q_worst: float,
-                     recorder=None,
-                     use_eft_slot: bool = True):
-    # use_est_slot=True 면 P 샘플 중 마지막 1개를 sample_est_action (EST-우선 휴리스틱)
-    # 의 action 으로 대체. Phase-2 grad-replay 가 (B,P) reward 의 argmax 슬롯만 추적하므로,
-    # 휴리스틱 trajectory 가 best 가 되면 모델이 자연스럽게 그 actions 을 imitate (BC).
-    # 모델이 휴리스틱을 따라잡으면 best 슬롯이 다시 모델 쪽으로 이동 → smooth handoff.
+                     recorder=None):
     BP = B * P
     batch_idx_full = torch.arange(B, device=device)[:, None].expand(B, P).contiguous()
     batch_idx_best = torch.arange(B, device=device)[:, None]
@@ -421,12 +416,6 @@ def sil_pomo_rollout(env: HFSPGraphEnv, model: FFSPModel,
     model.eval()
     model.model_params['eval_type'] = 'softmax' # P 샘플링을 위한 softmax 강제 변환
 
-    # use_est_slot: BP 안에서 p == P-1 슬롯만 EST 휴리스틱 action 으로 대체.
-    # BP layout 은 (B, P) row-major → bp_idx % P == P-1 이 마지막 슬롯.
-    est_slot_mask = None
-    if use_eft_slot:
-        est_slot_mask = (torch.arange(B * P, device=device) % P) == (P - 1)
-
     with torch.no_grad():
         # 총 step 수 = env.num_ops (J·S) 로 고정 — done.all() 동기화 제거.
         T = env.num_ops
@@ -438,18 +427,6 @@ def sil_pomo_rollout(env: HFSPGraphEnv, model: FFSPModel,
             edge_selected, flat_probs = model(state)
             if recorder is not None:
                 recorder.accumulate_entropy(flat_probs)
-
-            # EST override — 마지막 P 슬롯의 (machine, job) edge_selected 를 env-edge 가 아닌
-            # model action 공간(edge_selected = machine_idx*num_jobs + job_idx)으로 환산해 덮어씀.
-            # sample_est_action 은 env-edge idx 를 돌려주므로 역변환 필요:
-            #   env_edge = env_edge_lookup[op_for_j, machine_idx] → (machine_idx, op→job) 추출.
-            if est_slot_mask is not None:
-                est_env_edge = sample_est_action(env, {'feasible_mask': env.feasible_mask})
-                est_machine_idx = env.edge_machine[est_env_edge]
-                est_op_idx = env.edge_op[est_env_edge]
-                est_job_idx = est_op_idx // env.num_stages
-                est_action = est_machine_idx * env.num_jobs + est_job_idx
-                edge_selected = torch.where(est_slot_mask, est_action, edge_selected)
 
             states_seq.append(state)
             history_edge_selected[t] = edge_selected.detach()
@@ -548,7 +525,9 @@ def eval_pareto(eval_env: HFSPGraphEnv, model: FFSPModel,
                 env_edge_lookup_t, device, *,
                 batch_size: int, lambdas: torch.Tensor,
                 quality_helper: QualityHelper, seed: int,
-                m_ref: float, q_ref: float):
+                m_ref: float, q_ref: float,
+                norm_m_best: float = 100.0, norm_m_worst: float = 600.0,
+                norm_q_worst: float = 0.0, norm_q_best: float = 1.0):
 
     B = int(batch_size)
     L = int(lambdas.numel())
@@ -576,7 +555,18 @@ def eval_pareto(eval_env: HFSPGraphEnv, model: FFSPModel,
     q = q_flat.reshape(L, K)
 
     hv, nd = _hypervolume_2d(ms, q, m_ref, q_ref)
-    return ms, q, hv, nd
+
+    # ── Normalized HV ──
+    # (ms, q) 를 단위 박스로 매핑 후 ref=(1,0) 으로 HV 계산 → run 간 비교 가능한 [0,1] 스케일.
+    #   makespan: [norm_m_best(=100, best), norm_m_worst(=600, worst)] → [0,1]  (낮을수록 좋음)
+    #   yield:    [norm_q_worst(=0, worst), norm_q_best(=1, best)]    → [0,1]  (높을수록 좋음)
+    # 정규화 박스는 raw HV reference(m_ref/q_ref) 와 완전 분리 — 4 corner 를 여기서 직접 받음.
+    #   (q 가 q_ref/0.50 을 넘어도 분모가 norm_q_best=1.0 이라 q_n≤1 유지.)
+    # 정규화 좌표에서 HV reference 는 nadir corner = (ms_norm=1, q_norm=0).
+    ms_n = (ms - norm_m_best) / (norm_m_worst - norm_m_best)
+    q_n  = (q - norm_q_worst) / (norm_q_best - norm_q_worst)
+    hv_norm, _ = _hypervolume_2d(ms_n, q_n, m_ref=1.0, q_ref=0.0)
+    return ms, q, hv, nd, hv_norm
 
 
 def plot_pareto(ms: torch.Tensor, q: torch.Tensor, lambdas: torch.Tensor,

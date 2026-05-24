@@ -45,13 +45,43 @@ from DataRecorder import DataRecorder
 
 
 # =====================================================
+# HV 평가 / Pareto 그림 전용 고정 앵커 — 하드코딩, CLI 인자 아님.
+# reward 정규화(--hv_m_best/_worst, --hv_q_best/_worst)나 학습 loss/reward scale 에는
+# 전혀 영향 없음.
+#
+# [1] HV_REF_* — raw HV(`hv`) 의 reference point (nadir = 최악 코너). raw HV 는 절대 단위라
+#     epoch/실험 간 비교하려면 같은 값으로 고정해야 함 → 바꾸지 말 것 (바꾸면 과거 run 과 hv 비교 깨짐).
+#     makespan 이 HV_REF_M 초과 또는 yield 가 HV_REF_Q 미만인 점 → raw HV 기여 0.
+#     (best-ckpt 선택이 이 raw hv 기준. 원하면 plot 의 ref 마커로도 그대로 사용 가능.)
+# [2] HVN_* — normalized HV(`hvN`) 박스. (ms,q) 를 4 corner 로 [0,1]² 매핑 후 계산하는 run 간
+#     비교용 스케일. raw HV reference 와 완전 분리 — 박스 corner 를 여기서 직접 다 지정.
+#     makespan: [HVN_M_BEST, HVN_M_WORST]  → [0,1]  (낮을수록 좋음)
+#     yield:    [HVN_Q_WORST, HVN_Q_BEST]  → [0,1]  (높을수록 좋음)
+#     ※ yield 분모(HVN_Q_BEST=1.0)는 HV_REF_Q(0.50)와 분리 — q>0.50 여도 hvN≤1 유지.
+# [3] PLOT_* — Pareto scatter 그림의 축 범위. [1]/[2] HV 계산과 완전 독립, 순수 시각화용이라
+#     마음대로 바꿔도 hv/hvN 숫자에는 영향 없음 (보기 좋은 범위로 자유롭게 조절).
+#     makespan x축: [PLOT_M_MIN, PLOT_M_MAX] / yield y축: [PLOT_Q_MIN, PLOT_Q_MAX]
+# =====================================================
+HV_REF_M    = 600.0   # [1] raw HV reference makespan (worst corner)
+HV_REF_Q    = 0.50    # [1] raw HV reference yield    (worst corner)
+HVN_M_BEST  = 100.0   # [2] hvN makespan 정규화 best  (하한)
+HVN_M_WORST = 600.0   # [2] hvN makespan 정규화 worst (상한)
+HVN_Q_WORST = 0.0     # [2] hvN yield   정규화 worst  (하한)
+HVN_Q_BEST  = 1.0     # [2] hvN yield   정규화 best   (상한)
+PLOT_M_MIN  = 100.0   # [3] plot makespan x축 min
+PLOT_M_MAX  = 550.0   # [3] plot makespan x축 max
+PLOT_Q_MIN  = 0.50    # [3] plot yield    y축 min
+PLOT_Q_MAX  = 0.85    # [3] plot yield    y축 max
+
+
+# =====================================================
 # Default FFSPModel hyperparameters.
 # embedding/head/qkv/ff_hidden 은 MatNet 논문 default 를 따른 값.
 # ms_layer_init 은 attention bias projection 의 작은 초기화 상수 (재현용).
 # =====================================================
 def default_model_params(embedding_dim=128, head_num=8, qkv_dim=16,
                         encoder_layer_num=2, ff_hidden_dim=256,
-                        logit_clipping=5):
+                        logit_clipping=10):
     return {
         'embedding_dim': embedding_dim,
         'sqrt_embedding_dim': float(embedding_dim) ** 0.5,
@@ -115,9 +145,8 @@ def compute_random_baseline(env, quality_helper, B, P, seed=0):
 # =====================================================
 def train(num_epochs, n_accum, batch_size, pomo_size, 
           num_jobs, machine_cnt_list, 
-          eval_interval, eval_batch_size, pareto_lambda_count, ckpt_path, 
-          hv_m_best, hv_m_ref, hv_q_best, hv_q_ref,
-          est_slot_frac, 
+          eval_interval, eval_batch_size, pareto_lambda_count, ckpt_path,
+          hv_m_best, hv_m_worst, hv_q_best, hv_q_worst,
           wandb_enabled, wandb_project, wandb_run_name,
           time_low=3, time_high=22,
           lr=3e-4,
@@ -139,23 +168,6 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
     # - 같은 (scenario, λ) 안의 P 샘플로 POMO baseline variance 계산.
     print(f"[layout/accum] B={B} unique (scenario, λ) pairs × P={P} pomo samples")
     print(f"[layout/step]  n_accum={n_accum} → {n_accum*B} unique pairs per optimizer step")
-
-    # ── EST curriculum ──
-    # est_slot_frac in [0,1] → 처음 frac·num_epochs epoch 동안만 P 샘플 마지막 1개를
-    # sample_est_v2_action 으로 대체 (BC 신호 주입). cutoff 이후 모델 자력 학습으로 전환.
-    # None / False / 0 이면 처음부터 inject 안 함. 1.0 이면 학습 끝까지 켜짐.
-    if est_slot_frac is None or est_slot_frac is False or float(est_slot_frac) <= 0.0:
-        est_off_epoch = 0
-    else:
-        est_off_epoch = int(round(float(est_slot_frac) * num_epochs))
-    if est_off_epoch <= 0:
-        print(f"[inject] inject OFF for entire run (frac={est_slot_frac})")
-    elif est_off_epoch >= num_epochs:
-        print(f"[inject] inject ON for entire run "
-              f"(frac={est_slot_frac}, total_epochs={num_epochs})")
-    else:
-        print(f"[inject] inject ON for epoch 1..{est_off_epoch} / {num_epochs}, OFF after "
-              f"(frac={est_slot_frac})")
 
     env = HFSPGraphEnv(
         num_jobs=num_jobs, machine_cnt_list=list(machine_cnt_list),
@@ -225,8 +237,9 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
                     weight_decay=weight_decay, adam_betas=list(adam_betas),
                     warmup_ratio=warmup_ratio, warmup_epochs=warmup_epochs,
                     seed=seed, num_ops=env.num_ops,
-                    hv_m_best=hv_m_best, hv_m_ref=hv_m_ref,
-                    hv_q_best=hv_q_best, hv_q_ref=hv_q_ref,
+                    hv_m_best=hv_m_best, hv_m_worst=hv_m_worst,
+                    hv_q_best=hv_q_best, hv_q_worst=hv_q_worst,
+                    hv_ref_m=HV_REF_M, hv_ref_q=HV_REF_Q,
                     n_params=n_params, **model_params),
         feat_names=get_feat_names(env),
     )
@@ -234,9 +247,7 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
     # ── Random baseline 확인용 ──
     compute_random_baseline(env, quality_helper, B, P, seed=0)
 
-    # ── HV reference point (fixed across all epochs, user-specified) ──
-    # 2D hypervolume 의 ref point 는 epoch 간 HV 가 같은 좌표계에서 비교되도록 고정.
-    # m_ref = "worst makespan" anchor, q_ref = "worst yield" anchor.
+    # ── HV reference point / 정규화 박스는 파일 상단 하드코딩 상수 사용 (HV_REF_*, HVN_*). ──
     lam_num = 101
     lam_pool = torch.linspace(0.0, 1.0, lam_num, dtype=torch.float32, device=device)
     pareto_lambdas = torch.linspace(0.0, 1.0, int(pareto_lambda_count),
@@ -248,7 +259,6 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
     for epoch in range(1, num_epochs+1):
         t0 = time.time()
         model.train()
-        use_est_this_epoch = epoch <= est_off_epoch
 
         # Gradient accumulation: n_accum 회 micro-rollout → grad 누적 → 1번 step.
         # 매 micro 마다 fresh B λ 샘플 → 한 step 의 effective λ = n_accum × B.
@@ -276,10 +286,9 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
                     env, model, env_edge_lookup_t, device,
                     seed=chunk_seed, B=B, P=P, lambdas=lambdas_b,
                     quality_helper=quality_helper,
-                    m_best=hv_m_best, m_worst=hv_m_ref,
-                    q_best=hv_q_best, q_worst=hv_q_ref,
+                    m_best=hv_m_best, m_worst=hv_m_worst,
+                    q_best=hv_q_best, q_worst=hv_q_worst,
                     recorder=rec,
-                    use_eft_slot=use_est_this_epoch,
                 )
             # Shapes:
             #   log_prob_sum_best : (B,)   — Σ_t log π for each instance's best trajectory.
@@ -345,13 +354,17 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
         if epoch % eval_interval == 0 or epoch == num_epochs:
             t_eval_start = time.time()
             model.eval()
-            ms_lam, q_lam, hv, nd = eval_pareto(
+            ms_lam, q_lam, hv, nd, hv_norm = eval_pareto(
                 eval_env, model, eval_lookup_t, device,
                 batch_size=eval_batch_size, lambdas=pareto_lambdas,
                 quality_helper=quality_helper, seed=0,
-                m_ref=hv_m_ref, q_ref=hv_q_ref,
+                m_ref=HV_REF_M, q_ref=HV_REF_Q,
+                norm_m_best=HVN_M_BEST, norm_m_worst=HVN_M_WORST,
+                norm_q_worst=HVN_Q_WORST, norm_q_best=HVN_Q_BEST,
             )
             hv_mean = float(hv.mean())
+            hv_norm_mean = float(hv_norm.mean())
+            hv_norm_std = float(hv_norm.std())
             ep_ms = float(ms_lam[0].mean())     # λ=0 endpoint — makespan-only objective
             ep_q  = float(q_lam[-1].mean())     # λ=1 endpoint — yield-only objective
             # λ-conditioning gap. 0 근처 → collapse (λ 무시), 음수 → anti-conditioning (λ 반대로 해석)
@@ -362,34 +375,23 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
             hv_std = float(hv.std())
             nd_mean = float(nd.float().mean())
             log_msg = (f"eval  {epoch:4d}  hv={hv_mean:.3f}±{hv_std:.3f} "
+                        f"hvN={hv_norm_mean:.3f}±{hv_norm_std:.3f} "
                         f"ms@0={ep_ms:.1f} q@1={ep_q:.3f} "
                         f"Δms={d_ms:+.2f} Δq={d_q:+.3f} nd={nd_mean:.1f}")
 
             scatter_path = f"train_results/pareto_epoch_{epoch}.png"
-            # === Pareto plot 시각화 axis 하드코딩 (hv_* anchor 와 독립) ===
-            # 필요시 여기 값만 수정하면 됨. ref_point=None 이면 빨간 X 마커 안 그림.
-            PLOT_XLIM = (100.0, 500.0)   # makespan (x) min, max
-            PLOT_YLIM = (0.50, 0.85)     # yield (y) min, max
-            PLOT_REF  = None             # 예: (500.0, 0.50) 로 ref 마커 표시
+            # === Pareto plot 축 = 파일 상단 PLOT_* 전역변수 (HV 계산과 독립, 자유 조절) ===
+            PLOT_XLIM = (PLOT_M_MIN, PLOT_M_MAX)     # makespan x축
+            PLOT_YLIM = (PLOT_Q_MIN, PLOT_Q_MAX)     # yield    y축
+            PLOT_REF  = None             # 예: (HV_REF_M, HV_REF_Q) 로 raw HV nadir 마커 표시
             plot_pareto(ms_lam, q_lam, pareto_lambdas,
-                        scatter_path, title=f"epoch {epoch}  HV={hv_mean:.3f}",
+                        scatter_path,
+                        title=f"epoch {epoch}  HV={hv_mean:.3f}  normHV={hv_norm_mean:.3f}",
                         xlim=PLOT_XLIM, ylim=PLOT_YLIM, ref_point=PLOT_REF)
             rec.log_pareto(hv_mean, hv_std, ep_ms, ep_q,
                            nd_mean, scatter_path,
+                           hv_norm_mean, hv_norm_std,
                            d_ms=d_ms, d_q=d_q)
-
-            # ── Gantt of the best (min-makespan) schedule from this λ-sweep ──
-            # eval_pareto 의 마지막 rollout 상태가 eval_env 에 그대로 남아 있음.
-            # ms_lam (L,K) 의 flat argmin = row-major batch idx (lam_idx*K + k) → 그 원소를 렌더.
-            # argmin 이므로 makespan 최소 = 그림 폭(figsize ∝ makespan)도 최소.
-            best_b = int(ms_lam.argmin().item())
-            gantt_path = f"train_results/gantt_epoch_{epoch}.png"
-            eval_env.render_schedule(
-                batch_idx=best_b, save_path=gantt_path,
-                title=f"epoch {epoch} best",
-            )
-            if os.path.exists(gantt_path):   # render_schedule 은 미배치 시 early-return
-                rec.log_gantt(gantt_path)
 
             if hv_mean > best_eval:
                 best_eval = hv_mean
@@ -403,7 +405,7 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
                 'edge_feat_dim': edge_feat_dim,
                 'model_params': model_params,
                 'best_hv': best_eval,
-                'hv_m_ref': hv_m_ref, 'hv_q_ref': hv_q_ref,
+                'hv_ref_m': HV_REF_M, 'hv_ref_q': HV_REF_Q,
                 'epoch': epoch,
             }, ckpt_path)
 
@@ -415,18 +417,12 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
         # Reward 정규화 anchor — 현재 고정값이라 flat line. ms/mean·q/mean 수렴을
         # m_min/m_max·q_min/q_max 경계와 같은 차트에서 비교하기 위한 reference.
         # 인자 순서 (m_min, m_max, q_min, q_max) ← (best/낮은 ms, worst/높은 ms, worst/낮은 q, best/높은 q).
-        rec.log_anchors(hv_m_best, hv_m_ref, hv_q_ref, hv_q_best)
+        rec.log_anchors(hv_m_best, hv_m_worst, hv_q_worst, hv_q_best)
         rec.log_epoch(train_elapsed, cur_lr)
         rec.flush(step=epoch)
 
     rec.finish()
     return model
-
-def _parse_est_frac(s):
-    if s is None: return None
-    sl = str(s).strip().lower()
-    if sl in ('none', 'false', 'off', ''): return None
-    return float(s)
 
 if __name__ == "__main__":
     import argparse
@@ -453,19 +449,15 @@ if __name__ == "__main__":
                         'HV/scatter/endpoint 모두 이걸 사용.')
     p.add_argument('--hv_m_best', type=float, default=100.0,
                    help='Best (lowest) makespan anchor — reward 정규화 전용.')
-    p.add_argument('--hv_m_ref', type=float, default=500.0,
-                   help='Worst (highest) makespan anchor — HV ref + reward 정규화.')
+    p.add_argument('--hv_m_worst', type=float, default=600.0,
+                   help='Worst (highest) makespan anchor — reward 정규화 전용.')
     p.add_argument('--hv_q_best', type=float, default=0.85,
                    help='Best (highest) yield anchor — reward 정규화 전용.')
-    p.add_argument('--hv_q_ref', type=float, default=0.50,
-                   help='Worst (lowest) yield anchor — HV ref + reward 정규화.')
+    p.add_argument('--hv_q_worst', type=float, default=0.50,
+                   help='Worst (lowest) yield anchor — reward 정규화 전용.')
+    # HV reference point(--hv_ref_m/_q)는 CLI 인자 제거 — 파일 상단 HV_REF_M/HV_REF_Q 하드코딩.
     p.add_argument('--ckpt', type=str, default='checkpoints/hfsp_base_quality.pt',
                    help='Path to save best-HV checkpoint.')
-    p.add_argument('--est_slot', type=_parse_est_frac, default=0,
-                   help='EST heuristic injection curriculum. '
-                        'Float f in [0,1]: 처음 f·epochs 동안만 P 샘플 마지막 1개를 sample_est_v2_action 으로 대체, '
-                        'cutoff 이후 모델 자력 학습. None/false/off/0: 처음부터 안 씀. 1.0: 학습 끝까지 inject. '
-                        '초반 빠르게 휴리스틱 수준 도달 후 그 이상을 학습하도록 자연스럽게 handoff.')
     p.add_argument('--wandb_do', default=True,
                    help='Pass this flag to DISABLE WandB logging.')
     p.add_argument('--wandb_project', type=str, default='hfsp-asil-quality', help='WandB project name.')
@@ -485,11 +477,10 @@ if __name__ == "__main__":
         eval_batch_size=args.eval_batch_size,
         pareto_lambda_count=args.pareto_lambdas,
         hv_m_best=args.hv_m_best,
-        hv_m_ref=args.hv_m_ref,
+        hv_m_worst=args.hv_m_worst,
         hv_q_best=args.hv_q_best,
-        hv_q_ref=args.hv_q_ref,
+        hv_q_worst=args.hv_q_worst,
         ckpt_path=args.ckpt,
-        est_slot_frac=args.est_slot,
         wandb_enabled=args.wandb_do,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name,

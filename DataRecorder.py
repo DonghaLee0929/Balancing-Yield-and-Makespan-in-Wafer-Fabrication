@@ -28,7 +28,7 @@ class DataRecorder:
         if enabled and not _WANDB_OK:
             print('[DataRecorder] wandb 미설치 — 로깅 비활성')
         self.feat_names = feat_names or {}
-        self._buf: dict = {}       # one-shot (eval/, gantt, time/, lr 등)
+        self._buf: dict = {}       # one-shot (eval/, time/, lr 등)
         self._acc: dict = {}       # {key: (sum, count)} — flush 시 평균
         self._watched: list = []   # [(rf, cf, ef), ...]
         self._ent_sum = None       # policy entropy GPU 누적 (per-step sync 회피)
@@ -235,16 +235,14 @@ class DataRecorder:
             self._add('moe/id_expert_frac', load[-1])
             return  # 단일 CCO 블록 가정
 
-    def log_gantt(self, path):
-        if not self.enabled:
-            return
-        self._buf['gantt'] = wandb.Image(path)
-
     def log_pareto(self, hv_mean, hv_std, ms_at_lam0, q_at_lam1,
                    nd_mean, scatter_path,
+                   hv_norm_mean, hv_norm_std,
                    d_ms=None, d_q=None):
-        """λ-sweep 평가 결과: HV (메인), endpoint 성능, ND 다양성, scatter.
+        """λ-sweep 평가 결과: HV (메인), normalized HV, endpoint 성능, ND 다양성, scatter.
 
+        hv_norm = 단위 박스(makespan [100, hv_ref_m] × yield [0, hv_ref_q])로 정규화한 HV
+                  → run 간 비교 가능한 [0,1] 스케일.
         d_ms = ms@0 - ms@1 (proper λ-conditioning 이면 음수, collapse → 0).
         d_q  = q@1  - q@0  (proper λ-conditioning 이면 양수, collapse → 0).
         """
@@ -253,6 +251,8 @@ class DataRecorder:
         self._buf.update({
             'eval/hv_mean': float(hv_mean),
             'eval/hv_std': float(hv_std),
+            'eval/hv_norm_mean': float(hv_norm_mean),  # 정규화 HV (단위 박스 기준)
+            'eval/hv_norm_std': float(hv_norm_std),
             'eval/ms_at_lam0': float(ms_at_lam0),  # 순수 makespan 정책 평균
             'eval/q_at_lam1': float(q_at_lam1),    # 순수 yield 정책 평균
             'eval/nd_count': float(nd_mean),
