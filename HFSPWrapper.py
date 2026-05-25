@@ -15,6 +15,15 @@ from HFSPGraphEnv import HFSPGraphEnv
 from FFSPModel import FFSPModel
 
 # =====================================================
+# Scalarization toggle (SIL best-P selection 보상)
+# =====================================================
+# sil_pomo_rollout 에서 (m_hat, q_hat) ∈ [0,1] (1=best, ideal=(1,1)) 를 스칼라화하는 방식.
+#   None  → 일반 선형 가중합:        r = (1-λ)·m_hat + λ·q_hat
+#   True  → 순수 (weighted) Tchebycheff: r = -max((1-λ)(1-m_hat), λ(1-q_hat))
+#   float → 증강(augmented) Tchebycheff:  위 식 - ρ·((1-λ)(1-m_hat) + λ(1-q_hat))
+TCHEBYCHEFF = True
+
+# =====================================================
 # Feature channels
 # =====================================================
 def get_feat_names(env: HFSPGraphEnv) -> dict:
@@ -446,7 +455,16 @@ def sil_pomo_rollout(env: HFSPGraphEnv, model: FFSPModel,
     q_span = max(q_best  - q_worst, 1e-8)
     m_hat = (m_worst - (-G_ms)) / m_span
     q_hat = (G_q - q_worst) / q_span
-    r = (1.0 - lam_bp) * m_hat + lam_bp * q_hat
+
+    w_m, w_q = (1.0 - lam_bp), lam_bp
+    if TCHEBYCHEFF is None:
+        r = w_m * m_hat + w_q * q_hat                       # 일반 가중합
+    else:
+        d_m = w_m * (1.0 - m_hat)                           # ideal(=1)까지 가중 거리
+        d_q = w_q * (1.0 - q_hat)
+        r = -torch.maximum(d_m, d_q)                        # 순수 Tchebycheff
+        if TCHEBYCHEFF is not True:                         # float → 증강항 ρ
+            r = r - float(TCHEBYCHEFF) * (d_m + d_q)
     r_bp = r.view(B, P)
 
     best_p_idx = r_bp.argmax(dim=1)
