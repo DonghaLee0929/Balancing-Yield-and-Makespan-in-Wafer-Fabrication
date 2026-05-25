@@ -81,7 +81,7 @@ PLOT_Q_MAX  = 0.85    # [3] plot yield    y축 max
 # =====================================================
 def default_model_params(embedding_dim=128, head_num=8, qkv_dim=16,
                         encoder_layer_num=2, ff_hidden_dim=256,
-                        logit_clipping=10):
+                        logit_clipping=5):
     return {
         'embedding_dim': embedding_dim,
         'sqrt_embedding_dim': float(embedding_dim) ** 0.5,
