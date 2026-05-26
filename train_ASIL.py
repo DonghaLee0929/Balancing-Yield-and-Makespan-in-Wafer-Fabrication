@@ -64,7 +64,7 @@ from DataRecorder import DataRecorder
 # =====================================================
 HV_REF_M    = 600.0   # [1] raw HV reference makespan (worst corner)
 HV_REF_Q    = 0.50    # [1] raw HV reference yield    (worst corner)
-HVN_M_BEST  = 100.0   # [2] hvN makespan 정규화 best  (하한)
+HVN_M_BEST  = 100.0   # [2] hvN makespan 정규화 best  (하한) # Table과 비교용
 HVN_M_WORST = 600.0   # [2] hvN makespan 정규화 worst (상한)
 HVN_Q_WORST = 0.0     # [2] hvN yield   정규화 worst  (하한)
 HVN_Q_BEST  = 1.0     # [2] hvN yield   정규화 best   (상한)
@@ -276,6 +276,8 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
             # linspace(0,1,101) pool 에서 B 개 인덱스를 균등 추출 → (B,) instance-level λ.
             lam_idx = torch.randint(0, lam_num, (B,), generator=gen, device=device)
             lambdas_b = lam_pool[lam_idx]
+            lambdas_b[0] = 0
+            lambdas_b[-1] = 1
 
             # λ-conditioned SIL rollout — batch layout: B unique (scenario, λ) × P pomo samples.
             # 같은 (scenario, λ) 안 P 샘플의 reward 분산으로 POMO baseline 계산.

@@ -21,7 +21,7 @@ from FFSPModel import FFSPModel
 #   None  → 일반 선형 가중합:        r = (1-λ)·m_hat + λ·q_hat
 #   True  → 순수 (weighted) Tchebycheff: r = -max((1-λ)(1-m_hat), λ(1-q_hat))
 #   float → 증강(augmented) Tchebycheff:  위 식 - ρ·((1-λ)(1-m_hat) + λ(1-q_hat))
-TCHEBYCHEFF = True
+TCHEBYCHEFF = None
 
 # =====================================================
 # Feature channels
