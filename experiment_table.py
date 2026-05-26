@@ -7,6 +7,8 @@ experiment_table.py — 방법별 비교 표 (bi-objective HFSP: min makespan / 
     EST             |   est_jm 우선 휴리스틱 (λ 무관, 단일 점)
     Quality greedy  |   quality z-score 가 가장 큰 (job,machine) 선택 (λ 무관, 단일 점)
     NSGA2           |   nsga2.py 의 NSGA-II (population → Pareto front)
+    IABC            |   iabc.py 의 Improved Artificial Bee Colony (NSGA2 와 동일 decoder,
+                    |   평가 예산을 맞춰 runtime ≈ NSGA2; archive → Pareto front)
     Ours (g)        |   학습된 λ-conditioned 모델, greedy decoding (λ-sweep)
     Ours (s)        |   학습된 λ-conditioned 모델, stochastic sampling (λ-sweep × samples)
 
@@ -67,9 +69,11 @@ from test import (
 )
 # nsga2.py 의 NSGA-II decoder/loop 재사용.
 from nsga2 import HFSPDecoder, run_nsga2
+# iabc.py 의 IABC loop 재사용 (decoder/인스턴스/지표는 nsga2.py 와 1:1 공유).
+from iabc import run_iabc
 
 
-METHODS = ['EST', 'Quality greedy', 'NSGA2', 'Ours (g)', 'Ours (s)']
+METHODS = ['EST', 'Quality greedy', 'NSGA2', 'IABC', 'Ours (g)', 'Ours (s)']
 
 
 # =====================================================
@@ -213,8 +217,15 @@ def evaluate_one_path(*, env, model, env_edge_lookup_t, device,
                       problems_INT_list, machines, J, S,
                       q_idx, paths_idx, yield_mode, anchors, seed, ga_seed,
                       wq_min, wq_max, num_lambdas, samples,
-                      nsga_pop, nsga_gen):
-    """단일 path 인스턴스에 대해 method -> (ms_array, yld_array, time_s) dict 반환."""
+                      nsga_pop, nsga_gen,
+                      iabc_pop, iabc_gen, iabc_limit, iabc_p_global, iabc_archive_cap,
+                      methods=None):
+    """단일 path 인스턴스에 대해 method -> (ms_array, yld_array, time_s) dict 반환.
+
+    methods 로 실행할 방법만 골라 돌린다(None 이면 전체 METHODS). 예: ['Ours (g)',
+    'Ours (s)'] 면 모델만 실행하고 EST/Quality greedy/NSGA2/IABC 는 건너뛴다.
+    """
+    methods = methods or METHODS
     m_best, m_ref, q_best, q_ref = anchors
 
     wq_csv = f'quality_data/Q_{q_idx}/historical_paths_{paths_idx}.csv'
@@ -235,53 +246,79 @@ def evaluate_one_path(*, env, model, env_edge_lookup_t, device,
     outputs = {}
 
     # ── EST (단일 점, λ 무관) ──
-    (ms, yld), t = timed(lambda: _run_single_experiment(
-        None, env, env_edge_lookup_t, device, qh, scorer,
-        problems_INT_list, wq_1, torch.zeros(1, device=device),
-        1, 1, seed, True, method='est', yield_mode=yield_mode), device)
-    outputs['EST'] = (ms, yld, t)
+    if 'EST' in methods:
+        (ms, yld), t = timed(lambda: _run_single_experiment(
+            None, env, env_edge_lookup_t, device, qh, scorer,
+            problems_INT_list, wq_1, torch.zeros(1, device=device),
+            1, 1, seed, True, method='est', yield_mode=yield_mode), device)
+        outputs['EST'] = (ms, yld, t)
 
     # ── Quality greedy (단일 점, λ 무관) ──
-    (ms, yld), t = timed(lambda: run_quality_greedy(
-        env, qh, scorer, problems_INT_list, wq_1, seed, yield_mode, device), device)
-    outputs['Quality greedy'] = (ms, yld, t)
+    if 'Quality greedy' in methods:
+        (ms, yld), t = timed(lambda: run_quality_greedy(
+            env, qh, scorer, problems_INT_list, wq_1, seed, yield_mode, device), device)
+        outputs['Quality greedy'] = (ms, yld, t)
+
+    # ── NSGA-II / IABC 공통 decoder 입력 (둘 중 하나라도 돌릴 때만 준비) ──
+    if 'NSGA2' in methods or 'IABC' in methods:
+        env_edge_lookup_np = env.env_edge_lookup.cpu().numpy()
+        machine_offset_np = np.cumsum([0] + machines[:-1]).astype(np.int64)
+        wq_np_j = wq_1[0].cpu().numpy().astype(np.float64)                     # (J,)
 
     # ── NSGA-II (population → front) ──
-    env_edge_lookup_np = env.env_edge_lookup.cpu().numpy()
-    machine_offset_np = np.cumsum([0] + machines[:-1]).astype(np.int64)
-    wq_np_j = wq_1[0].cpu().numpy().astype(np.float64)                         # (J,)
+    if 'NSGA2' in methods:
+        def _run_nsga():
+            decoder = HFSPDecoder(env, problems_INT_list, env_edge_lookup_np,
+                                  machine_offset_np, scorer, wq_np_j,
+                                  yield_mode=yield_mode, yield_objective='ground_truth',
+                                  quality_helper=None)   # 예측 모델 없음 → GT oracle 만
+            _, _, ms_n, gt_n, _, _ = run_nsga2(
+                decoder, J, S, machines,
+                pop_size=nsga_pop, n_gen=nsga_gen, seed=ga_seed,
+                hv_anchors=(m_best, m_ref, q_best, q_ref))
+            return ms_n.astype(np.float32), gt_n.astype(np.float32)
 
-    def _run_nsga():
-        decoder = HFSPDecoder(env, problems_INT_list, env_edge_lookup_np,
-                              machine_offset_np, scorer, wq_np_j,
-                              yield_mode=yield_mode, yield_objective='ground_truth',
-                              quality_helper=None)   # 예측 모델 없음 → GT oracle 만
-        _, _, ms_n, gt_n, _, _ = run_nsga2(
-            decoder, J, S, machines,
-            pop_size=nsga_pop, n_gen=nsga_gen, seed=ga_seed,
-            hv_anchors=(m_best, m_ref, q_best, q_ref))
-        return ms_n.astype(np.float32), gt_n.astype(np.float32)
+        (ms, yld), t = timed(_run_nsga, device)
+        outputs['NSGA2'] = (ms, yld, t)
 
-    (ms, yld), t = timed(_run_nsga, device)
-    outputs['NSGA2'] = (ms, yld, t)
+    # ── IABC (Improved Artificial Bee Colony; NSGA2 와 동일 decoder/인스턴스) ──
+    # 외부 Pareto archive(비지배 front)를 결과 점집합으로 사용. cycle 수(iabc_gen)는
+    # NSGA2 와 평가 예산을 맞춰 산정되므로 runtime ≈ NSGA2 (main 에서 자동 산정).
+    if 'IABC' in methods:
+        def _run_iabc():
+            decoder = HFSPDecoder(env, problems_INT_list, env_edge_lookup_np,
+                                  machine_offset_np, scorer, wq_np_j,
+                                  yield_mode=yield_mode, yield_objective='ground_truth',
+                                  quality_helper=None)   # 예측 모델 없음 → GT oracle 만
+            archive, _ = run_iabc(
+                decoder, J, S, machines,
+                pop_size=iabc_pop, n_gen=iabc_gen, limit=iabc_limit,
+                p_global=iabc_p_global, archive_cap=iabc_archive_cap, seed=ga_seed,
+                hv_anchors=(m_best, m_ref, q_best, q_ref))
+            return archive['ms'].astype(np.float32), archive['gt'].astype(np.float32)
+
+        (ms, yld), t = timed(_run_iabc, device)
+        outputs['IABC'] = (ms, yld, t)
 
     # ── Ours (greedy) — λ-sweep, samples=1 ──
-    (ms, yld), t = timed(lambda: _run_single_experiment(
-        model, env, env_edge_lookup_t, device, qh, scorer,
-        problems_INT_list, wq_1, lam_g, num_lambdas, 1, seed, True,
-        method='model', yield_mode=yield_mode), device)
-    outputs['Ours (g)'] = (ms, yld, t)
+    if 'Ours (g)' in methods:
+        (ms, yld), t = timed(lambda: _run_single_experiment(
+            model, env, env_edge_lookup_t, device, qh, scorer,
+            problems_INT_list, wq_1, lam_g, num_lambdas, 1, seed, True,
+            method='model', yield_mode=yield_mode), device)
+        outputs['Ours (g)'] = (ms, yld, t)
 
     # ── Ours (sampling) — λ-sweep × samples, stochastic ──
-    def _run_sample():
-        torch.manual_seed(seed)                # 샘플링 재현성 (방법 실행 순서 무관)
-        return _run_single_experiment(
-            model, env, env_edge_lookup_t, device, qh, scorer,
-            problems_INT_list, wq_1, lam_s, num_lambdas * samples, 1, seed, False,
-            method='model', yield_mode=yield_mode)
+    if 'Ours (s)' in methods:
+        def _run_sample():
+            torch.manual_seed(seed)                # 샘플링 재현성 (방법 실행 순서 무관)
+            return _run_single_experiment(
+                model, env, env_edge_lookup_t, device, qh, scorer,
+                problems_INT_list, wq_1, lam_s, num_lambdas * samples, 1, seed, False,
+                method='model', yield_mode=yield_mode)
 
-    (ms, yld), t = timed(_run_sample, device)
-    outputs['Ours (s)'] = (ms, yld, t)
+        (ms, yld), t = timed(_run_sample, device)
+        outputs['Ours (s)'] = (ms, yld, t)
 
     return outputs, anchors
 
@@ -299,15 +336,16 @@ def _fmt(vals, nd):
     return f"{mean:.{nd}f}"
 
 
-def build_table(agg, header, n_paths):
+def build_table(agg, header, n_paths, methods=None):
     """agg[method][metric] = list(per-path values) → 출력 문자열 + (가능시) DataFrame."""
+    methods = methods or METHODS
     cols = ['Method', 'HV ↑', 'IGD+ ↓', 'Makespan ↓', 'Quality ↑', 'Time (s)']
     decimals = {'HV ↑': 4, 'IGD+ ↓': 4, 'Makespan ↓': 1, 'Quality ↑': 4, 'Time (s)': 2}
     key_map = {'HV ↑': 'HV', 'IGD+ ↓': 'IGD+', 'Makespan ↓': 'Makespan',
                'Quality ↑': 'Quality', 'Time (s)': 'Time'}
 
     rows = []
-    for m in METHODS:
+    for m in methods:
         row = {'Method': m}
         for c in cols[1:]:
             row[c] = _fmt(agg[m][key_map[c]], decimals[c])
@@ -334,16 +372,17 @@ def build_table(agg, header, n_paths):
 # =====================================================
 # Optional overlay plot (단일 path 일 때만)
 # =====================================================
-def plot_fronts(per_method_pts, anchors, save_path, title):
+def plot_fronts(per_method_pts, anchors, save_path, title, methods=None):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    methods = methods or METHODS
     m_best, m_ref, q_best, q_ref = anchors
 
     fig, ax = plt.subplots(figsize=(8.0, 5.5))
     colors = {'EST': 'tab:gray', 'Quality greedy': 'tab:green', 'NSGA2': 'tab:orange',
-              'Ours (g)': 'tab:blue', 'Ours (s)': 'tab:red'}
-    for name in METHODS:
+              'IABC': 'tab:purple', 'Ours (g)': 'tab:blue', 'Ours (s)': 'tab:red'}
+    for name in methods:
         ms, yld = per_method_pts[name]
         ms = np.asarray(ms, np.float64); yld = np.asarray(yld, np.float64)
         front = compute_pareto_front(ms, yld)
@@ -383,8 +422,8 @@ def _parse_idx_spec(s: str) -> list[int]:
 # 10,6,14,6,10,14
 # 20,12,28,12,20,28
 def main():
-    p = argparse.ArgumentParser(description="HFSP 방법 비교 표 (EST/Quality greedy/NSGA2/Ours).")
-    p.add_argument('--ckpt', type=str, default='checkpoints/saved_new_new_baseline.pt')
+    p = argparse.ArgumentParser(description="HFSP 방법 비교 표.")
+    p.add_argument('--ckpt', type=str, default='checkpoints/saved_0,1_0526.pt')
     p.add_argument('--num_jobs', type=int, default=25)
     p.add_argument('--machines', type=str, default='5,3,7,3,5,7',
                    help="stage별 머신 수. stage 수는 CSV의 6 고정. base(5,3,7,3,5,7) 초과 시 "
@@ -395,9 +434,20 @@ def main():
                    help="historical_paths 인덱스. '1' / '1~10' / '1,3,5'. 여러 개면 path 평균.")
     p.add_argument('--yield_mode', type=str, default='raw', choices=['raw', 'percentile'])
     p.add_argument('--num_lambdas', type=int, default=32, help="Ours 의 λ grid 크기.")
-    p.add_argument('--samples', type=int, default=8, help="Ours (s) 의 λ 당 sample 수.")
+    p.add_argument('--samples', type=int, default=64, help="Ours (s) 의 λ 당 sample 수.")
     p.add_argument('--nsga_pop', type=int, default=100)
-    p.add_argument('--nsga_gen', type=int, default=100)
+    p.add_argument('--nsga_gen', type=int, default=200)
+    p.add_argument('--iabc_pop', type=int, default=0,
+                   help="IABC food source 수 SN. 0 이면 nsga_pop 와 동일.")
+    p.add_argument('--iabc_gen', type=int, default=0,
+                   help="IABC cycle 수. 0 이면 NSGA2 와 평가 예산(개체 평가 횟수)을 맞춰 "
+                        "자동 산정 → runtime ≈ NSGA2. (IABC 는 cycle 당 ~2·SN 평가)")
+    p.add_argument('--iabc_limit', type=int, default=20,
+                   help="scout 발동 임계 (개선 실패 trial ≥ limit → 재초기화).")
+    p.add_argument('--iabc_p_global', type=float, default=0.5,
+                   help="이웃해 생성 시 archive elite 를 guide 로 쓸 확률 (gbest-guided).")
+    p.add_argument('--iabc_archive_cap', type=int, default=200,
+                   help="IABC 외부 Pareto archive 용량.")
     p.add_argument('--xlim', type=str, default='100,600',
                    help="makespan anchor 'm_best,m_ref'.")
     p.add_argument('--ylim', type=str, default='0,1',
@@ -406,7 +456,13 @@ def main():
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--ga_seed', type=int, default=0)
     p.add_argument('--out', type=str, default='test_results/comparison_table')
-    p.add_argument('--no_plot', action='store_false')
+    p.add_argument('--no_plot', default=False,
+                   help="True 면 overlay 플롯 저장 안 함.")
+    p.add_argument('--only_model', default=True,
+                   help="True 면 모델(Ours g/s)만 실행하고 EST/Quality greedy/NSGA2/IABC 는 "
+                        "건너뛴다. (baseline 을 이미 돌려 둔 경우 모델만 빠르게 재평가) IGD+ 는 "
+                        "실행한 방법들끼리만 산정되고, 출력 파일명에 '_model' 접미사가 붙어 전체 "
+                        "표를 덮어쓰지 않는다.")
     args = p.parse_args()
 
     machines = [int(x) for x in args.machines.split(',')]
@@ -420,14 +476,35 @@ def main():
         q_ref, q_best = 0.0, 100.0
     anchors = (m_best, m_ref, q_best, q_ref)
 
+    # --only_model: 모델만 실행 (baseline 재사용). 그 외엔 전체 6개 방법.
+    methods = ['Ours (g)', 'Ours (s)'] if args.only_model else list(METHODS)
+
+    # ── IABC pop/gen: runtime 을 NSGA2 에 맞추도록 평가 예산(개체 평가 횟수) 정렬 ──
+    # NSGA2 = pop·(gen+1) 평가,  IABC ≈ pop·(1+2·gen) 평가(employed+onlooker, scout 무시).
+    # 같은 decoder 라 평가 횟수 ∝ wall-clock → iabc_gen 을 역산해 runtime ≈ NSGA2.
+    iabc_pop = args.iabc_pop if args.iabc_pop > 0 else args.nsga_pop
+    if args.iabc_gen > 0:
+        iabc_gen = args.iabc_gen
+    else:
+        nsga_evals = args.nsga_pop * (args.nsga_gen + 1)
+        iabc_gen = max(1, round((nsga_evals / iabc_pop - 1) / 2))
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.manual_seed(args.seed)
     print(f"[table] device={device}  W={J}  machines={machines}  "
           f"(Q{args.q_idx},P{args.p_idx})  paths={paths_idx_list}  "
           f"yield_mode={args.yield_mode}")
     print(f"[table] anchors: m=[best={m_best}, ref={m_ref}]  q=[ref={q_ref}, best={q_best}]")
-    print(f"[table] Ours: λ×{args.num_lambdas}, samples/λ={args.samples}  |  "
-          f"NSGA-II: pop={args.nsga_pop}, gen={args.nsga_gen}  (yield=ground-truth only)")
+    if args.only_model:
+        print(f"[table] Ours only: λ×{args.num_lambdas}, samples/λ={args.samples}  "
+              f"(EST/Quality greedy/NSGA2/IABC 건너뜀)")
+    else:
+        print(f"[table] Ours: λ×{args.num_lambdas}, samples/λ={args.samples}  |  "
+              f"NSGA-II: pop={args.nsga_pop}, gen={args.nsga_gen}  (yield=ground-truth only)")
+        print(f"[table] IABC: pop={iabc_pop}, gen={iabc_gen}"
+              f"{' (auto, runtime≈NSGA2)' if args.iabc_gen <= 0 else ''}  "
+              f"limit={args.iabc_limit}, p_global={args.iabc_p_global}, "
+              f"archive_cap={args.iabc_archive_cap}")
 
     # ── env / proc_time / 모델 (path 무관, 한 번만) ──
     # proc_time 도 machines 가 base 초과면 (m%base) 복제 증강해서 로드.
@@ -448,7 +525,7 @@ def main():
 
     # ── path 별 평가 ──
     agg = {m: {'HV': [], 'IGD+': [], 'Makespan': [], 'Quality': [], 'Time': []}
-           for m in METHODS}
+           for m in methods}
     last_pts = None
     for paths_idx in paths_idx_list:
         print(f"\n========== paths_{paths_idx} ==========")
@@ -459,19 +536,22 @@ def main():
             anchors=anchors, seed=args.seed, ga_seed=args.ga_seed,
             wq_min=wq_min, wq_max=wq_max,
             num_lambdas=args.num_lambdas, samples=args.samples,
-            nsga_pop=args.nsga_pop, nsga_gen=args.nsga_gen)
+            nsga_pop=args.nsga_pop, nsga_gen=args.nsga_gen,
+            iabc_pop=iabc_pop, iabc_gen=iabc_gen, iabc_limit=args.iabc_limit,
+            iabc_p_global=args.iabc_p_global, iabc_archive_cap=args.iabc_archive_cap,
+            methods=methods)
 
         # 1st pass: 방법별 독립 지표(HV/Makespan/Quality) + 점집합 수집.
         last_pts = {}
         md_all = {}
-        for name in METHODS:
+        for name in methods:
             ms, yld, t = outputs[name]
             md_all[name] = (compute_metrics(ms, yld, anchors), t)
             last_pts[name] = (ms, yld)
 
-        # 2nd pass: 5개 방법 점을 합쳐 best-known front → 방법별 IGD+ (공통 기준 필요).
+        # 2nd pass: 실행한 방법 점을 합쳐 best-known front → 방법별 IGD+ (공통 기준 필요).
         ref_front = build_reference_front(last_pts, anchors)
-        for name in METHODS:
+        for name in methods:
             md, t = md_all[name]
             ms, yld = last_pts[name]
             igd = igd_plus_metric(ms, yld, ref_front, anchors)
@@ -488,10 +568,11 @@ def main():
     # ── 표 출력 + 저장 ──
     header = (f"N={J}, M={machines}, (Q{args.q_idx},P{args.p_idx}), "
               f"yield={args.yield_mode}")
-    table_str, rows = build_table(agg, header, len(paths_idx_list))
+    table_str, rows = build_table(agg, header, len(paths_idx_list), methods)
     print(table_str)
 
-    args.out = f'test_results/J{J}_M{sum(machines)}_table'
+    suffix = '_model' if args.only_model else ''
+    args.out = f'test_results/J{J}_M{sum(machines)}_table{suffix}'
     csv_path = f"{args.out}.csv"
     try:
         import pandas as pd
@@ -503,7 +584,7 @@ def main():
     if not args.no_plot and len(paths_idx_list) == 1 and last_pts is not None:
         png_path = f"{args.out}.png"
         plot_fronts(last_pts, anchors, png_path,
-                    title=f"{header}  paths_{paths_idx_list[0]}")
+                    title=f"{header}  paths_{paths_idx_list[0]}", methods=methods)
         print(f"saved -> {png_path}")
 
 
