@@ -451,7 +451,7 @@ if __name__ == "__main__":
                         'HV/scatter/endpoint 모두 이걸 사용.')
     p.add_argument('--hv_m_best', type=float, default=100.0,
                    help='Best (lowest) makespan anchor — reward 정규화 전용.')
-    p.add_argument('--hv_m_worst', type=float, default=600.0,
+    p.add_argument('--hv_m_worst', type=float, default=500.0,
                    help='Worst (highest) makespan anchor — reward 정규화 전용.')
     p.add_argument('--hv_q_best', type=float, default=0.85,
                    help='Best (highest) yield anchor — reward 정규화 전용.')
