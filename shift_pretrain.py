@@ -50,7 +50,7 @@ from quality_prediction import analysis
 
 
 def make_shifted_csv(scenario, base_csv, out_csv, base_machines, wq_min, wq_max,
-                     s1_delta=0.01):
+                     s1_delta=0.1):
     """base CSV 의 Yield 라벨을 shifted step_q 로 재계산해 out_csv 에 저장.
 
     Returns: (machines_eff, removed_local_idx | None, n_rows_in, n_rows_out).
@@ -109,7 +109,7 @@ def main():
                    help="base stage별 머신 수 (experiment_shift 와 일치시킬 것).")
     p.add_argument('--scenarios', type=str, default='1,2,3',
                    help="재학습할 시나리오. '1,2,3' / '2' / '1~3'.")
-    p.add_argument('--s1_delta', type=float, default=0.01,
+    p.add_argument('--s1_delta', type=float, default=0.1,
                    help="시나리오1 강도: 최고품질 기계를 (그 stage 최저 - s1_delta) 로. "
                         "⚠ experiment_shift.py 의 --s1_delta 와 동일 값으로 평가해야 공정 비교.")
     p.add_argument('--wafer_quality', type=str, default='0.99,1.00')

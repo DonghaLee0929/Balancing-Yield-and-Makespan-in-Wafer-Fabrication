@@ -61,6 +61,10 @@ from experiment_table import (
     igd_plus_metric,
     timed,
     _fmt,
+    save_baseline_cache,
+    load_baseline_cache,
+    cache_meta_mismatch,
+    COMPARISON_DIR,
 )
 
 
@@ -101,7 +105,7 @@ def _recompute_zq_local(gq: GroundTruthQuality) -> None:
     gq._all_products_sorted = None    # percentile 채점 캐시 무효화
 
 
-def apply_scenario(gq: GroundTruthQuality, scenario: int, s1_delta: float = 0.01) -> int | None:
+def apply_scenario(gq: GroundTruthQuality, scenario: int, s1_delta: float = 0.1) -> int | None:
     """gq 의 마지막 stage step_q 를 시나리오대로 in-place 변형.
 
     1: 최고품질 기계를 (그 stage 최저 - s1_delta) 로,  2: 순위 reverse(값 집합 유지),
@@ -136,7 +140,7 @@ def apply_scenario(gq: GroundTruthQuality, scenario: int, s1_delta: float = 0.01
 
 
 def build_shifted_instance(scenario, base_csv, p_csv, num_jobs, base_machines,
-                           device, wq_min, wq_max, s1_delta=0.01):
+                           device, wq_min, wq_max, s1_delta=0.1):
     """시나리오별 (shifted GT scorer, proc_time, 유효 machine_cnt_list) 구성.
 
     scorer(=GroundTruthQuality) 는 base CSV 로 만든 뒤 마지막 stage 를 시나리오대로 변형.
@@ -186,6 +190,32 @@ def make_quality_helper(zip_path, num_stages, device):
 
 
 # =====================================================
+# NSGA 결과 캐시 — 느린 NSGA front 점을 시나리오별 test_results/comparison/ 에 저장,
+# 키(meta) 일치 시 재실행에서 로드해 재계산을 건너뛴다. experiment_table 의 캐시 머신 재사용.
+# =====================================================
+def nsga_cache_path(scenario, J, machines_eff, nsga_pop, nsga_gen, s1_delta):
+    """시나리오·인스턴스·pop/gen 별 npz 경로. s1_delta 는 scenario 1 에서만 front 에 영향 → 파일명에 포함."""
+    mtag = '-'.join(str(m) for m in machines_eff)
+    extra = f"_d{s1_delta:g}" if scenario == 1 else ""
+    return os.path.join(
+        COMPARISON_DIR,
+        f"shift_NSGA_s{scenario}{extra}_pop{nsga_pop}_gen{nsga_gen}_J{J}M{mtag}.npz")
+
+
+def nsga_cache_meta(*, scenario, s1_delta, q_idx, p_idx, J, base_machines, machines_eff,
+                    nsga_pop, nsga_gen, ga_seed, yield_mode, wq_min, wq_max, seed, anchors):
+    """캐시 무효화 키 — NSGA 출력 점에 영향을 주는 모든 설정. 하나라도 다르면 재계산."""
+    return {
+        'scenario': int(scenario), 's1_delta': float(s1_delta),
+        'q_idx': int(q_idx), 'p_idx': int(p_idx), 'J': int(J),
+        'base_machines': list(base_machines), 'machines_eff': list(machines_eff),
+        'nsga_pop': int(nsga_pop), 'nsga_gen': int(nsga_gen), 'ga_seed': int(ga_seed),
+        'yield_mode': str(yield_mode), 'wq_min': float(wq_min), 'wq_max': float(wq_max),
+        'seed': int(seed), 'anchors': [float(a) for a in anchors],
+    }
+
+
+# =====================================================
 # 방법별 front 산출 (모델 λ-sweep / NSGA)
 # =====================================================
 def model_front(model, env, env_edge_lookup_t, device, quality_helper, scorer,
@@ -225,7 +255,8 @@ def nsga_front(env, scorer, proc, wq_1, machines_eff, J, S, anchors,
 def evaluate_one_path(*, scenario, base_policy, device, J, S, base_machines,
                       base_csv, p_csv, anchors, seed, ga_seed, wq_min, wq_max,
                       num_lambdas, samples, nsga_pop, nsga_gen, yield_mode,
-                      pred_base_zip, pred_shift_zip, gt_ckpt, s1_delta=0.01):
+                      pred_base_zip, pred_shift_zip, gt_ckpt, s1_delta=0.1,
+                      q_idx=3, p_idx=3, paths_idx=1, nsga_refresh=False):
     """scenario 의 한 path → {row: (ms, yld, time_s)} dict."""
     gq, proc, machines_eff = build_shifted_instance(
         scenario, base_csv, p_csv, J, base_machines, device, wq_min, wq_max,
@@ -261,11 +292,34 @@ def evaluate_one_path(*, scenario, base_policy, device, J, S, base_machines,
         num_lambdas, samples, seed, yield_mode), device)
     out['gt=shift'] = (ms, yld, t)
 
-    # NSGA (GT) : shifted GT scorer.
-    (ms, yld), t = timed(lambda: nsga_front(
-        env, gq, proc, wq_1, machines_eff, J, S, anchors,
-        nsga_pop, nsga_gen, ga_seed, yield_mode), device)
-    out['NSGA (GT)'] = (ms, yld, t)
+    # NSGA (GT) : shifted GT scorer. 느린 단계 → 시나리오별 캐시(키 일치 시 로드).
+    nsga_meta = nsga_cache_meta(
+        scenario=scenario, s1_delta=s1_delta, q_idx=q_idx, p_idx=p_idx, J=J,
+        base_machines=base_machines, machines_eff=machines_eff,
+        nsga_pop=nsga_pop, nsga_gen=nsga_gen, ga_seed=ga_seed, yield_mode=yield_mode,
+        wq_min=wq_min, wq_max=wq_max, seed=seed, anchors=anchors)
+    cpath = nsga_cache_path(scenario, J, machines_eff, nsga_pop, nsga_gen, s1_delta)
+    hit = False
+    if not nsga_refresh:
+        cached, meta = load_baseline_cache(cpath, paths_idx)
+        if cached is not None:
+            mism = cache_meta_mismatch(meta, nsga_meta)
+            if not mism:
+                ms, yld, t = cached
+                out['NSGA (GT)'] = (np.asarray(ms, np.float32),
+                                    np.asarray(yld, np.float32), t)
+                print(f"  [nsga-cache] hit -> {cpath} "
+                      f"(p{paths_idx}, |pts|={np.asarray(ms).size}, orig t={t:.1f}s)")
+                hit = True
+            else:
+                print(f"  [nsga-cache] key mismatch {mism} → 재계산")
+    if not hit:
+        (ms, yld), t = timed(lambda: nsga_front(
+            env, gq, proc, wq_1, machines_eff, J, S, anchors,
+            nsga_pop, nsga_gen, ga_seed, yield_mode), device)
+        out['NSGA (GT)'] = (ms, yld, t)
+        save_baseline_cache(cpath, paths_idx, ms, yld, t, nsga_meta)
+        print(f"  [nsga-cache] saved -> {cpath} (p{paths_idx})")
 
     return out, machines_eff
 
@@ -377,7 +431,9 @@ def run_scenario(scenario, *, base_policy, device, args, paths_idx_list,
             nsga_pop=args.nsga_pop, nsga_gen=args.nsga_gen,
             yield_mode=args.yield_mode,
             pred_base_zip=pred_base_zip, pred_shift_zip=pred_shift_zip,
-            gt_ckpt=gt_ckpt, s1_delta=args.s1_delta)
+            gt_ckpt=gt_ckpt, s1_delta=args.s1_delta,
+            q_idx=args.q_idx, p_idx=args.p_idx, paths_idx=paths_idx,
+            nsga_refresh=args.nsga_refresh)
 
         # 1st pass: 방법별 독립 지표(HV/Makespan/Quality) + 점집합.
         pts = {r: (out[r][0], out[r][1]) for r in ROWS}
@@ -462,7 +518,7 @@ def main():
                    help="historical_paths 인덱스. '1' / '1~10' / '1,3,5'. 여러 개면 path 평균.")
     p.add_argument('--scenarios', type=str, default='1,2,3',
                    help="실행할 시나리오. 예 '1,2,3' / '2'.")
-    p.add_argument('--s1_delta', type=float, default=0.01,
+    p.add_argument('--s1_delta', type=float, default=0.1,
                    help="시나리오1 강도: 최고품질 기계를 (그 stage 최저 - s1_delta) 로. "
                         "키울수록 stale 예측모델(pred=base) 페널티 ↑. "
                         "⚠ shift_pretrain.py 의 --s1_delta 와 동일 값으로 학습해야 공정 비교.")
@@ -493,6 +549,8 @@ def main():
                    help="모델 λ 당 sample 수 (>1=stochastic, 1=greedy). 클수록 front 풍부·느림.")
     p.add_argument('--nsga_pop', type=int, default=100)
     p.add_argument('--nsga_gen', type=int, default=200)
+    p.add_argument('--nsga_refresh', default=False,
+                   help="NSGA 캐시를 무시하고 강제 재계산+덮어쓰기. 켜려면 --nsga_refresh 1.")
     p.add_argument('--xlim', type=str, default='100,600',
                    help="makespan anchor 'm_best,m_ref'.")
     p.add_argument('--ylim', type=str, default='0,1',
