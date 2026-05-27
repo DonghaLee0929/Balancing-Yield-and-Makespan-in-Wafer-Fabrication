@@ -32,9 +32,10 @@ from hummingbird.ml import convert
 
 warnings.filterwarnings("ignore")
 
-def analysis(q_id = 1, paths_id = 2):
+def analysis(q_id = 1, paths_id = 2, csv_path = None, out_dir = None):
     # ── 1. 데이터 로드 ────────────────────────────────────────────────────────────
-    csv_path = f"quality_data/Q_{q_id}/historical_paths_{paths_id}.csv"
+    if csv_path is None:
+        csv_path = f"quality_data/Q_{q_id}/historical_paths_{paths_id}.csv"
     if not os.path.isfile(csv_path):
         raise FileNotFoundError(f"File not found: {csv_path}")
 
@@ -130,7 +131,8 @@ def analysis(q_id = 1, paths_id = 2):
         "step_importance": step_importance if hasattr(best_model, "feature_importances_") else {},
     }
 
-    out_dir = f"quality_results/Q_{q_id}/paths_{paths_id}"
+    if out_dir is None:
+        out_dir = f"quality_results/Q_{q_id}/paths_{paths_id}"
     os.makedirs(out_dir, exist_ok=True)
 
     results_path = f"{out_dir}/model_results.json"

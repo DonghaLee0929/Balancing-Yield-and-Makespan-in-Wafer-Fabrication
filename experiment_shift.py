@@ -51,7 +51,7 @@ from HFSPWrapper import QualityHelper, make_env_edge_lookup, get_feat_dims
 from quality_augment import GroundTruthQuality, load_proc_time_augmented
 
 # test.py 의 모델/EST rollout 평가 머신 재사용.
-from test import _run_single_experiment
+from test import _run_single_experiment, compute_pareto_front
 # nsga2.py 의 NSGA-II decoder/loop 재사용.
 from nsga2 import HFSPDecoder, run_nsga2
 # experiment_table.py 의 지표(HV/IGD+)·타이밍·포맷 그대로 재사용 → 표 수치 1:1 일치.
@@ -101,10 +101,10 @@ def _recompute_zq_local(gq: GroundTruthQuality) -> None:
     gq._all_products_sorted = None    # percentile 채점 캐시 무효화
 
 
-def apply_scenario(gq: GroundTruthQuality, scenario: int) -> int | None:
+def apply_scenario(gq: GroundTruthQuality, scenario: int, s1_delta: float = 0.01) -> int | None:
     """gq 의 마지막 stage step_q 를 시나리오대로 in-place 변형.
 
-    1: 최고품질 기계를 (그 stage 최저 - 0.01) 로,  2: 순위 reverse(값 집합 유지),
+    1: 최고품질 기계를 (그 stage 최저 - s1_delta) 로,  2: 순위 reverse(값 집합 유지),
     3: 최고품질 기계 1개 제거 → machine_cnt_list[last] 1 감소.
     Returns: 제거한 기계 local index (scenario 3) 또는 None (1·2).
     """
@@ -115,7 +115,7 @@ def apply_scenario(gq: GroundTruthQuality, scenario: int) -> int | None:
 
     if scenario == 1:
         b = int(np.argmax(q))
-        q[b] = q.min() - 0.01                       # 최고 → 최저보다 0.01 작게
+        q[b] = q.min() - s1_delta                   # 최고 → 최저보다 s1_delta 작게
         gq.step_q[last, :cnt] = q
     elif scenario == 2:
         order = np.argsort(q)                       # 오름차순 인덱스 (order[0]=최저 기계)
@@ -136,7 +136,7 @@ def apply_scenario(gq: GroundTruthQuality, scenario: int) -> int | None:
 
 
 def build_shifted_instance(scenario, base_csv, p_csv, num_jobs, base_machines,
-                           device, wq_min, wq_max):
+                           device, wq_min, wq_max, s1_delta=0.01):
     """시나리오별 (shifted GT scorer, proc_time, 유효 machine_cnt_list) 구성.
 
     scorer(=GroundTruthQuality) 는 base CSV 로 만든 뒤 마지막 stage 를 시나리오대로 변형.
@@ -146,7 +146,7 @@ def build_shifted_instance(scenario, base_csv, p_csv, num_jobs, base_machines,
     gq = GroundTruthQuality(num_stages=S, device=device, csv_path=base_csv,
                             machine_cnt_list=list(base_machines),
                             wafer_quality_min=wq_min, wafer_quality_max=wq_max)
-    removed = apply_scenario(gq, scenario)
+    removed = apply_scenario(gq, scenario, s1_delta=s1_delta)
     machines_eff = list(gq.machine_cnt_list)
 
     proc = load_proc_time_augmented(p_csv, num_jobs, base_machines, device)
@@ -225,10 +225,11 @@ def nsga_front(env, scorer, proc, wq_1, machines_eff, J, S, anchors,
 def evaluate_one_path(*, scenario, base_policy, device, J, S, base_machines,
                       base_csv, p_csv, anchors, seed, ga_seed, wq_min, wq_max,
                       num_lambdas, samples, nsga_pop, nsga_gen, yield_mode,
-                      pred_base_zip, pred_shift_zip, gt_ckpt):
+                      pred_base_zip, pred_shift_zip, gt_ckpt, s1_delta=0.01):
     """scenario 의 한 path → {row: (ms, yld, time_s)} dict."""
     gq, proc, machines_eff = build_shifted_instance(
-        scenario, base_csv, p_csv, J, base_machines, device, wq_min, wq_max)
+        scenario, base_csv, p_csv, J, base_machines, device, wq_min, wq_max,
+        s1_delta=s1_delta)
 
     env = HFSPGraphEnv(num_jobs=J, machine_cnt_list=machines_eff, device=device)
     env_edge_lookup_t = make_env_edge_lookup(env).to(device)
@@ -303,6 +304,47 @@ def build_table(agg, header, n_paths):
     return out, rows
 
 
+# 4행 색맵 (Pareto 플롯). pred=base 파랑 / pred=shift 빨강 / gt=shift 초록 / NSGA 주황.
+ROW_COLORS = {'pred=base': 'tab:blue', 'pred=shift': 'tab:red',
+              'gt=shift': 'tab:green', 'NSGA (GT)': 'tab:orange'}
+
+
+def plot_scenario_fronts(pts, save_path, title):
+    """4행의 점집합을 한 그림에 overlay — 옅은 산점도 + Pareto front 선/마커.
+
+    pts[row] = (ms, yld). 축은 데이터에 autoscale 해 방법 간 차이를 최대로 보이게 한다.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8.0, 5.5))
+    for r in ROWS:
+        ms = np.asarray(pts[r][0], np.float64).ravel()
+        yld = np.asarray(pts[r][1], np.float64).ravel()
+        if ms.size == 0:
+            continue
+        c = ROW_COLORS[r]
+        ax.scatter(ms, yld, s=12, alpha=0.22, color=c)
+        front = compute_pareto_front(ms, yld)
+        if front.size >= 2:
+            order = np.argsort(ms[front])              # makespan 오름차순 연결
+            ax.plot(ms[front][order], yld[front][order], '-o', ms=4, lw=1.4,
+                    color=c, label=r)
+        elif front.size == 1:
+            ax.scatter(ms[front], yld[front], s=90, marker='*',
+                       color=c, edgecolor='black', zorder=5, label=r)
+    ax.set_xlabel('Makespan ↓')
+    ax.set_ylabel('Yield ↑')
+    ax.set_title(title, fontsize=9)
+    ax.grid(True, linestyle='--', alpha=0.4)
+    ax.legend(loc='best', fontsize=8)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+    fig.savefig(save_path, dpi=120, bbox_inches='tight')
+    plt.close(fig)
+
+
 # =====================================================
 # 한 시나리오 전체 (path 평균)
 # =====================================================
@@ -311,14 +353,17 @@ def run_scenario(scenario, *, base_policy, device, args, paths_idx_list,
                  pred_base_zip, pred_shift_zip, gt_ckpt):
     J, S = args.num_jobs, len(base_machines)
     p_csv = f'quality_data/P_{args.p_idx}.csv'
+    desc = (f"최고품질 기계 → (그 stage 최저 - {args.s1_delta})" if scenario == 1
+            else SCENARIO_DESC[scenario])
 
-    print(f"\n############## Scenario {scenario}: {SCENARIO_DESC[scenario]} ##############")
+    print(f"\n############## Scenario {scenario}: {desc} ##############")
     if os.path.abspath(pred_shift_zip) == os.path.abspath(pred_base_zip):
         print(f"[note] pred=shift 예측모델이 base 와 동일 — adapted 모델 학습 후 "
               f"--pred_s{scenario} 로 교체하세요 (지금은 pred=base 와 같은 결과).")
 
     agg = {r: {'HV': [], 'IGD+': [], 'Makespan': [], 'Quality': [], 'Time': []}
            for r in ROWS}
+    plot_pts = {r: ([], []) for r in ROWS}          # path 별 점 누적 (Pareto 플롯용)
     machines_eff = None
     for paths_idx in paths_idx_list:
         base_csv = f'quality_data/Q_{args.q_idx}/historical_paths_{paths_idx}.csv'
@@ -332,7 +377,7 @@ def run_scenario(scenario, *, base_policy, device, args, paths_idx_list,
             nsga_pop=args.nsga_pop, nsga_gen=args.nsga_gen,
             yield_mode=args.yield_mode,
             pred_base_zip=pred_base_zip, pred_shift_zip=pred_shift_zip,
-            gt_ckpt=gt_ckpt)
+            gt_ckpt=gt_ckpt, s1_delta=args.s1_delta)
 
         # 1st pass: 방법별 독립 지표(HV/Makespan/Quality) + 점집합.
         pts = {r: (out[r][0], out[r][1]) for r in ROWS}
@@ -347,12 +392,14 @@ def run_scenario(scenario, *, base_policy, device, args, paths_idx_list,
             agg[r]['Makespan'].append(md[r]['Makespan'])
             agg[r]['Quality'].append(md[r]['Quality'])
             agg[r]['Time'].append(t)
+            plot_pts[r][0].append(np.asarray(ms, np.float64).ravel())
+            plot_pts[r][1].append(np.asarray(yld, np.float64).ravel())
             igd_str = '—' if np.isnan(igd) else f"{igd:.4f}"
             print(f"  {r:11s}  HV={md[r]['HV']:.4f}  IGD+={igd_str}  "
                   f"ms={md[r]['Makespan']:.1f}  q={md[r]['Quality']:.4f}  "
                   f"t={t:.2f}s  |pts|={np.asarray(ms).size}")
 
-    header = (f"Scenario {scenario} ({SCENARIO_DESC[scenario]})  |  "
+    header = (f"Scenario {scenario} ({desc})  |  "
               f"N={J}, M={machines_eff}, (Q{args.q_idx},P{args.p_idx}), "
               f"yield={args.yield_mode}")
     table_str, rows = build_table(agg, header, len(paths_idx_list))
@@ -366,6 +413,16 @@ def run_scenario(scenario, *, base_policy, device, args, paths_idx_list,
         print(f"saved -> {csv_path}")
     except Exception as e:
         print(f"[warn] CSV 저장 실패: {e}")
+
+    png_path = f'test_results/shift_scenario{scenario}_W{J}_pareto.png'
+    try:
+        pts_cat = {r: (np.concatenate(plot_pts[r][0]) if plot_pts[r][0] else np.array([]),
+                       np.concatenate(plot_pts[r][1]) if plot_pts[r][1] else np.array([]))
+                   for r in ROWS}
+        plot_scenario_fronts(pts_cat, png_path, header)
+        print(f"saved -> {png_path}")
+    except Exception as e:
+        print(f"[warn] Pareto 플롯 저장 실패: {e}")
     return rows
 
 
@@ -382,6 +439,15 @@ def _parse_idx_spec(s: str) -> list[int]:
     return [int(s)]
 
 
+def default_shift_pred(q_idx: int, scenario: int) -> str:
+    """shift_pretrain.py 가 저장하는 시나리오별 adapted 예측모델 관례 경로 (존재할 때만 반환).
+
+    빈 문자열이면 호출부에서 pred_base 로 폴백 → adapted 모델이 아직 없으면 기존 동작 유지.
+    """
+    path = f'quality_results/Q_{q_idx}/shift_s{scenario}/best_hb_model.zip'
+    return path if os.path.exists(path) else ''
+
+
 def main():
     p = argparse.ArgumentParser(
         description="품질 시나리오 변화(shift) 대비 모델 성능 비교 표 "
@@ -396,9 +462,13 @@ def main():
                    help="historical_paths 인덱스. '1' / '1~10' / '1,3,5'. 여러 개면 path 평균.")
     p.add_argument('--scenarios', type=str, default='1,2,3',
                    help="실행할 시나리오. 예 '1,2,3' / '2'.")
+    p.add_argument('--s1_delta', type=float, default=0.01,
+                   help="시나리오1 강도: 최고품질 기계를 (그 stage 최저 - s1_delta) 로. "
+                        "키울수록 stale 예측모델(pred=base) 페널티 ↑. "
+                        "⚠ shift_pretrain.py 의 --s1_delta 와 동일 값으로 학습해야 공정 비교.")
     # 정책 체크포인트.
     p.add_argument('--ckpt_base', type=str,
-                   default='checkpoints/saved_new_new_baseline.pt',
+                   default='checkpoints/0523_baseline.pt',
                    help="pred=base / pred=shift 가 공유하는 base 정책.")
     p.add_argument('--ckpt_gt', type=str, default='',
                    help="gt=shift 정책 공통 기본값 (빈값=ckpt_base). 시나리오별로 "
@@ -411,7 +481,9 @@ def main():
                    default='quality_results/Q_3/paths_1/best_hb_model.zip',
                    help="pred=base 예측모델 (옛 품질 landscape).")
     p.add_argument('--pred_s1', type=str, default='',
-                   help="시나리오1 adapted 예측모델 (빈값=pred_base).")
+                   help="시나리오1 adapted 예측모델. 빈값이면 "
+                        "quality_results/Q_{q_idx}/shift_s1/best_hb_model.zip "
+                        "(shift_pretrain.py 산출물) 가 있으면 그걸, 없으면 pred_base 를 사용.")
     p.add_argument('--pred_s2', type=str, default='')
     p.add_argument('--pred_s3', type=str, default='')
     # 평가 설정.
@@ -420,7 +492,7 @@ def main():
     p.add_argument('--samples', type=int, default=64,
                    help="모델 λ 당 sample 수 (>1=stochastic, 1=greedy). 클수록 front 풍부·느림.")
     p.add_argument('--nsga_pop', type=int, default=100)
-    p.add_argument('--nsga_gen', type=int, default=10)
+    p.add_argument('--nsga_gen', type=int, default=200)
     p.add_argument('--xlim', type=str, default='100,600',
                    help="makespan anchor 'm_best,m_ref'.")
     p.add_argument('--ylim', type=str, default='0,1',
@@ -455,6 +527,9 @@ def main():
     print(f"[shift] base 정책={args.ckpt_base}")
     print(f"[shift] 모델: λ×{args.num_lambdas}, samples/λ={args.samples}  |  "
           f"NSGA-II: pop={args.nsga_pop}, gen={args.nsga_gen}")
+    if 1 in scenarios:
+        print(f"[shift] scenario1 s1_delta={args.s1_delta} "
+              f"(pred=shift 예측모델도 같은 s1_delta 로 학습됐는지 확인)")
 
     # base 정책은 시나리오·env 무관(그래프 모델) → 한 번만 로드해 재사용.
     tmp_env = HFSPGraphEnv(num_jobs=args.num_jobs,
@@ -464,7 +539,9 @@ def main():
     all_rows = {}
     for scenario in scenarios:
         gt_ckpt = gt_ckpt_map[scenario] or gt_default
-        pred_shift_zip = pred_zip_map[scenario] or args.pred_base
+        pred_shift_zip = (pred_zip_map[scenario]
+                          or default_shift_pred(args.q_idx, scenario)
+                          or args.pred_base)
         all_rows[scenario] = run_scenario(
             scenario, base_policy=base_policy, device=device, args=args,
             paths_idx_list=paths_idx_list, anchors=anchors,

@@ -17,6 +17,6 @@ REM python experiment_table.py --num_jobs 100 --machines 20,12,28,12,20,28
 REM echo ----- done (exit %errorlevel%) -----
 REM echo.
 
-echo ===== pareto =====
-python experiment_pareto.py
-echo ----- done (exit %errorlevel%) -----
+REM echo ===== pareto =====
+REM python experiment_pareto.py
+REM echo ----- done (exit %errorlevel%) -----

@@ -154,6 +154,11 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
           adam_betas=(0.9, 0.95),
           warmup_ratio=0.1,
           seed=1,
+          # ── 아래는 train_continual.py 용 선택 인자 (모두 default = 기존 동작 그대로) ──
+          init_ckpt=None,          # 주어지면 그 ckpt 가중치로 warm-start (이어학습). 없으면 fresh init.
+          quality_helper=None,     # 주어지면 그대로 사용(피처/보상 예측기 주입). 없으면 Q_3/paths_1 로드.
+          epoch_ckpt_dir=None,     # 주어지면 매 save_interval 에폭마다 epoch_{e}.pt 저장 (학습곡선용).
+          save_interval=0,         # 0 = 매-에폭 저장 안 함(기존 동작). 1 = 매 에폭.
           ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.manual_seed(seed)
@@ -177,12 +182,18 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
     # Quality prediction resources — separate from env.
     # env 는 -makespan 만 반환하고 yield 는 모름. episode 끝에 wrapper 가 완성된 op→machine
     # path + wafer_quality 를 helper.compute_yield 로 넘겨 sklearn pipeline 으로 예측 받음.
-    quality_helper = QualityHelper(
-        num_stages=env.num_stages,
-        device=device,
-        model_path="quality_results/Q_3/paths_1/best_hb_model.zip",
-        wafer_path="quality_results/Q_3/paths_1/wafer_quality.json",
-    )
+    # quality_helper 가 외부 주입되면(이어학습: 피처/보상 예측기 교체) 그대로 쓰고,
+    # 아니면 기존처럼 Q_3/paths_1 예측기를 로드한다.
+    if quality_helper is None:
+        quality_helper = QualityHelper(
+            num_stages=env.num_stages,
+            device=device,
+            model_path="quality_results/Q_3/paths_1/best_hb_model.zip",
+            wafer_path="quality_results/Q_3/paths_1/wafer_quality.json",
+        )
+    else:
+        print(f"[init] quality_helper 주입됨 → {type(quality_helper).__name__} "
+              f"(continual: 피처/보상 예측기 외부 지정)")
     row_feat_dim, col_feat_dim, edge_feat_dim = get_feat_dims(env)
     print(f"[init] B={B}  P={P}  BP={BP}  "
           f"row_feat_dim={row_feat_dim}  col_feat_dim={col_feat_dim}  "
@@ -191,8 +202,19 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
           f"device={device}")
 
     # Model / optimizer / LR scheduler init.
-    model_params = default_model_params()
-    model = FFSPModel(row_feat_dim, col_feat_dim, edge_feat_dim, **model_params).to(device)
+    # init_ckpt 가 있으면 그 ckpt 의 아키텍처(model_params/dims)로 빌드 후 가중치 로드(warm-start).
+    # 없으면 기존처럼 default_model_params() 로 fresh init.
+    if init_ckpt:
+        _ck = torch.load(init_ckpt, map_location=device, weights_only=False)
+        model_params = _ck['model_params']
+        model = FFSPModel(_ck['row_feat_dim'], _ck['col_feat_dim'],
+                          _ck.get('edge_feat_dim', edge_feat_dim), **model_params).to(device)
+        model.load_state_dict(_ck['model'])
+        print(f"[init] warm-start <- {init_ckpt}  "
+              f"(소스 epoch={_ck.get('epoch', '?')}, best_hv={_ck.get('best_hv', '?')})")
+    else:
+        model_params = default_model_params()
+        model = FFSPModel(row_feat_dim, col_feat_dim, edge_feat_dim, **model_params).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr, betas=tuple(adam_betas), weight_decay=weight_decay,
     )
@@ -332,6 +354,19 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
         optimizer.step()
         scheduler.step()
+
+        # ── (옵션) 매 save_interval 에폭마다 ckpt 저장 — continual 학습곡선용 ──
+        # 아래 eval-시점 best-HV 저장과 별개로, step 직후 가중치를 epoch_{e}.pt 로 남긴다.
+        if epoch_ckpt_dir and save_interval > 0 and epoch % save_interval == 0:
+            os.makedirs(epoch_ckpt_dir, exist_ok=True)
+            torch.save({
+                'model': model.state_dict(),
+                'row_feat_dim': row_feat_dim,
+                'col_feat_dim': col_feat_dim,
+                'edge_feat_dim': edge_feat_dim,
+                'model_params': model_params,
+                'epoch': epoch,
+            }, os.path.join(epoch_ckpt_dir, f'epoch_{epoch}.pt'))
 
         loss_mean = torch.stack(loss_buf).mean().item()
         avg_ms = torch.stack(ms_avg_buf).mean().item()

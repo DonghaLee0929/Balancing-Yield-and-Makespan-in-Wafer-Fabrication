@@ -37,6 +37,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import json
 import argparse
 
 # 로컬 test.py 가 stdlib `test` 패키지에 가려지지 않도록 스크립트 디렉터리를 최우선에.
@@ -103,9 +104,9 @@ def sample_quality_greedy_action(env: HFSPGraphEnv, quality_helper: GroundTruthQ
 
 
 def run_quality_greedy(env, quality_helper, scorer, problems_INT_list, wq_1,
-                       seed, yield_mode, device):
+                       seed, device):
     """quality-greedy 1회 rollout → (makespans[1], yields[1]). _run_single_experiment 의
-    yield 계산(raw/percentile)을 그대로 복제해 다른 방법과 동일 ground-truth 로 채점."""
+    yield 계산(raw)을 그대로 복제해 다른 방법과 동일 ground-truth 로 채점."""
     ept = problems_to_edge_proc_time(problems_INT_list, env, 1)
     env.reset(seed=seed, batch_size=1, edge_proc_time=ept, identical_job=True)
     T = env.num_ops
@@ -115,12 +116,9 @@ def run_quality_greedy(env, quality_helper, scorer, problems_INT_list, wq_1,
 
     ms = env.makespan().cpu().numpy().astype(np.float32)        # (1,)
     paths = schedule_paths_1indexed(env)                        # (1, J, S)
-    if yield_mode == 'percentile':
-        yld = scorer.score(paths).mean(axis=1).astype(np.float32)
-    else:
-        prod_bj = scorer.path_product(paths)                    # (1, J)
-        wq_np = wq_1.cpu().numpy()                              # (1, J)
-        yld = (prod_bj * wq_np).mean(axis=1).astype(np.float32)
+    prod_bj = scorer.path_product(paths)                        # (1, J)
+    wq_np = wq_1.cpu().numpy()                                  # (1, J)
+    yld = (prod_bj * wq_np).mean(axis=1).astype(np.float32)
     return ms, yld
 
 
@@ -211,11 +209,80 @@ def timed(fn, device):
 
 
 # =====================================================
+# Baseline 결과 캐시 — test_results/comparison/ 에 baseline(EST / Quality greedy /
+# NSGA2 / IABC) 의 front 점을 저장해 두고, --only_model run 에서 로드해 비교군으로 보여준다.
+# 파일명에는 *방법론·pop·gen·인스턴스(J{J}M{M})* 만 기록(사용자 요청). 파일 안에는 path 별
+# (ms, yld, time) 과 재사용 정합성 검증용 meta(JSON: 캐시 키) 를 함께 담는다.
+# =====================================================
+COMPARISON_DIR = 'test_results/comparison'
+BASELINES = ['EST', 'Quality greedy', 'NSGA2', 'IABC']
+
+
+def baseline_cache_path(method, J, M, nsga_pop, nsga_gen, iabc_pop, iabc_gen):
+    """method(+pop+gen)+인스턴스 → test_results/comparison/<tag>_J{J}M{M}.npz 경로.
+    EST/Quality greedy 는 pop/gen 이 없어 method+인스턴스만 기록."""
+    slug = method.replace(' ', '_')
+    if method == 'NSGA2':
+        tag = f"{slug}_pop{nsga_pop}_gen{nsga_gen}"
+    elif method == 'IABC':
+        tag = f"{slug}_pop{iabc_pop}_gen{iabc_gen}"
+    else:                                          # EST / Quality greedy (휴리스틱)
+        tag = slug
+    return os.path.join(COMPARISON_DIR, f"{tag}_J{J}M{M}.npz")
+
+
+def _baseline_meta(method, base, nsga_pop, nsga_gen, iabc_pop, iabc_gen):
+    """캐시 정합성 검증용 meta(=캐시 무효화 키). base 공통 키 + 방법별 pop/gen."""
+    if method == 'NSGA2':
+        return {**base, 'pop': nsga_pop, 'gen': nsga_gen}
+    if method == 'IABC':
+        return {**base, 'pop': iabc_pop, 'gen': iabc_gen}
+    return dict(base)
+
+
+def save_baseline_cache(path, paths_idx, ms, yld, t, meta):
+    """path 별 (ms, yld, t) 를 기존 파일에 *병합* 저장(다른 path 엔트리는 보존). meta 는 JSON."""
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    data = {}
+    if os.path.exists(path):
+        with np.load(path, allow_pickle=True) as z:
+            data = {k: z[k] for k in z.files}
+    data[f'p{paths_idx}_ms'] = np.asarray(ms, dtype=np.float32).ravel()
+    data[f'p{paths_idx}_yld'] = np.asarray(yld, dtype=np.float32).ravel()
+    data[f'p{paths_idx}_t'] = np.asarray(float(t), dtype=np.float32)
+    data['meta'] = np.asarray(json.dumps(meta))
+    np.savez(path, **data)
+
+
+def load_baseline_cache(path, paths_idx):
+    """해당 path 의 (ms, yld, t) 와 meta 로드. 파일/엔트리 없으면 (None, meta-or-None)."""
+    if not os.path.exists(path):
+        return None, None
+    with np.load(path, allow_pickle=True) as z:
+        meta = json.loads(z['meta'].item()) if 'meta' in z.files else None
+        if f'p{paths_idx}_ms' not in z.files:
+            return None, meta
+        ms = z[f'p{paths_idx}_ms']
+        yld = z[f'p{paths_idx}_yld']
+        t = float(z[f'p{paths_idx}_t'])
+    return (ms, yld, t), meta
+
+
+def cache_meta_mismatch(meta, cur):
+    """저장 당시 meta 와 현재 run(cur) 의 캐시 키가 다른 항목 목록. meta 없으면 빈 목록.
+    tuple/list·dict 순서 차이는 JSON 정규화로 흡수해 오탐을 막는다."""
+    if not meta:
+        return []
+    return [k for k, v in cur.items()
+            if json.dumps(meta.get(k), sort_keys=True) != json.dumps(v, sort_keys=True)]
+
+
+# =====================================================
 # Per-path evaluation — 한 인스턴스(path)에 대해 5개 방법 모두 실행
 # =====================================================
 def evaluate_one_path(*, env, model, env_edge_lookup_t, device,
                       problems_INT_list, machines, J, S,
-                      q_idx, paths_idx, yield_mode, anchors, seed, ga_seed,
+                      q_idx, paths_idx, anchors, seed, ga_seed,
                       wq_min, wq_max, num_lambdas, samples,
                       nsga_pop, nsga_gen,
                       iabc_pop, iabc_gen, iabc_limit, iabc_p_global, iabc_archive_cap,
@@ -250,13 +317,13 @@ def evaluate_one_path(*, env, model, env_edge_lookup_t, device,
         (ms, yld), t = timed(lambda: _run_single_experiment(
             None, env, env_edge_lookup_t, device, qh, scorer,
             problems_INT_list, wq_1, torch.zeros(1, device=device),
-            1, 1, seed, True, method='est', yield_mode=yield_mode), device)
+            1, 1, seed, True, method='est'), device)
         outputs['EST'] = (ms, yld, t)
 
     # ── Quality greedy (단일 점, λ 무관) ──
     if 'Quality greedy' in methods:
         (ms, yld), t = timed(lambda: run_quality_greedy(
-            env, qh, scorer, problems_INT_list, wq_1, seed, yield_mode, device), device)
+            env, qh, scorer, problems_INT_list, wq_1, seed, device), device)
         outputs['Quality greedy'] = (ms, yld, t)
 
     # ── NSGA-II / IABC 공통 decoder 입력 (둘 중 하나라도 돌릴 때만 준비) ──
@@ -270,7 +337,7 @@ def evaluate_one_path(*, env, model, env_edge_lookup_t, device,
         def _run_nsga():
             decoder = HFSPDecoder(env, problems_INT_list, env_edge_lookup_np,
                                   machine_offset_np, scorer, wq_np_j,
-                                  yield_mode=yield_mode, yield_objective='ground_truth',
+                                  yield_objective='ground_truth',
                                   quality_helper=None)   # 예측 모델 없음 → GT oracle 만
             _, _, ms_n, gt_n, _, _ = run_nsga2(
                 decoder, J, S, machines,
@@ -288,7 +355,7 @@ def evaluate_one_path(*, env, model, env_edge_lookup_t, device,
         def _run_iabc():
             decoder = HFSPDecoder(env, problems_INT_list, env_edge_lookup_np,
                                   machine_offset_np, scorer, wq_np_j,
-                                  yield_mode=yield_mode, yield_objective='ground_truth',
+                                  yield_objective='ground_truth',
                                   quality_helper=None)   # 예측 모델 없음 → GT oracle 만
             archive, _ = run_iabc(
                 decoder, J, S, machines,
@@ -305,7 +372,7 @@ def evaluate_one_path(*, env, model, env_edge_lookup_t, device,
         (ms, yld), t = timed(lambda: _run_single_experiment(
             model, env, env_edge_lookup_t, device, qh, scorer,
             problems_INT_list, wq_1, lam_g, num_lambdas, 1, seed, True,
-            method='model', yield_mode=yield_mode), device)
+            method='model'), device)
         outputs['Ours (g)'] = (ms, yld, t)
 
     # ── Ours (sampling) — λ-sweep × samples, stochastic ──
@@ -315,7 +382,7 @@ def evaluate_one_path(*, env, model, env_edge_lookup_t, device,
             return _run_single_experiment(
                 model, env, env_edge_lookup_t, device, qh, scorer,
                 problems_INT_list, wq_1, lam_s, num_lambdas * samples, 1, seed, False,
-                method='model', yield_mode=yield_mode)
+                method='model')
 
         (ms, yld), t = timed(_run_sample, device)
         outputs['Ours (s)'] = (ms, yld, t)
@@ -395,8 +462,6 @@ def plot_fronts(per_method_pts, anchors, save_path, title, methods=None):
                        color=colors[name], edgecolor='black', zorder=5, label=name)
     ax.set_xlabel('Makespan ↓'); ax.set_ylabel('Yield ↑')
     ax.set_xlim(m_best, m_ref)
-    if q_best > 1.5:   # percentile 모드
-        ax.set_ylim(0, 100)
     ax.set_title(title)
     ax.grid(True, linestyle='--', alpha=0.4)
     ax.legend(loc='best', fontsize=8)
@@ -423,7 +488,7 @@ def _parse_idx_spec(s: str) -> list[int]:
 # 20,12,28,12,20,28
 def main():
     p = argparse.ArgumentParser(description="HFSP 방법 비교 표.")
-    p.add_argument('--ckpt', type=str, default='checkpoints/saved_0,1_0526.pt')
+    p.add_argument('--ckpt', type=str, default='checkpoints/0523_baseline.pt')
     p.add_argument('--num_jobs', type=int, default=25)
     p.add_argument('--machines', type=str, default='5,3,7,3,5,7',
                    help="stage별 머신 수. stage 수는 CSV의 6 고정. base(5,3,7,3,5,7) 초과 시 "
@@ -432,11 +497,10 @@ def main():
     p.add_argument('--q_idx', type=int, default=3, choices=[1, 2, 3])
     p.add_argument('--paths_idx', type=str, default='1',
                    help="historical_paths 인덱스. '1' / '1~10' / '1,3,5'. 여러 개면 path 평균.")
-    p.add_argument('--yield_mode', type=str, default='raw', choices=['raw', 'percentile'])
     p.add_argument('--num_lambdas', type=int, default=32, help="Ours 의 λ grid 크기.")
     p.add_argument('--samples', type=int, default=64, help="Ours (s) 의 λ 당 sample 수.")
     p.add_argument('--nsga_pop', type=int, default=100)
-    p.add_argument('--nsga_gen', type=int, default=200)
+    p.add_argument('--nsga_gen', type=int, default=300)
     p.add_argument('--iabc_pop', type=int, default=0,
                    help="IABC food source 수 SN. 0 이면 nsga_pop 와 동일.")
     p.add_argument('--iabc_gen', type=int, default=0,
@@ -451,33 +515,33 @@ def main():
     p.add_argument('--xlim', type=str, default='100,600',
                    help="makespan anchor 'm_best,m_ref'.")
     p.add_argument('--ylim', type=str, default='0,1',
-                   help="yield anchor 'q_ref,q_best'. percentile 모드는 0,100 으로 강제.")
+                   help="yield anchor 'q_ref,q_best'.")
     p.add_argument('--wafer_quality', type=str, default='0.99,1.00')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--ga_seed', type=int, default=0)
     p.add_argument('--out', type=str, default='test_results/comparison_table')
     p.add_argument('--no_plot', default=False,
                    help="True 면 overlay 플롯 저장 안 함.")
-    p.add_argument('--only_model', default=True,
+    p.add_argument('--only_model', default=False,
                    help="True 면 모델(Ours g/s)만 실행하고 EST/Quality greedy/NSGA2/IABC 는 "
-                        "건너뛴다. (baseline 을 이미 돌려 둔 경우 모델만 빠르게 재평가) IGD+ 는 "
-                        "실행한 방법들끼리만 산정되고, 출력 파일명에 '_model' 접미사가 붙어 전체 "
-                        "표를 덮어쓰지 않는다.")
+                        "test_results/comparison/ 캐시에서 로드해 비교군으로 표시(없으면 Ours 만). "
+                        "baseline 을 다시 돌리지 않아 빠르고, 같은 캐시 키(J/M/q/p/seed/ga_seed/"
+                        "pop/gen/anchors)면 IGD+ 도 전체 run 과 정합. 출력 파일명엔 '_model' 접미사가 "
+                        "붙어 전체 표를 덮어쓰지 않는다. (전체 run = --only_model False 가 캐시를 생성)")
     args = p.parse_args()
 
     machines = [int(x) for x in args.machines.split(',')]
-    J, S = args.num_jobs, len(machines)
+    J, S, M = args.num_jobs, len(machines), sum(machines)
     paths_idx_list = _parse_idx_spec(args.paths_idx)
     wq_min, wq_max = [float(x) for x in args.wafer_quality.split(',')]
 
     m_best, m_ref = [float(x) for x in args.xlim.split(',')]
     q_ref, q_best = [float(x) for x in args.ylim.split(',')]
-    if args.yield_mode == 'percentile':
-        q_ref, q_best = 0.0, 100.0
     anchors = (m_best, m_ref, q_best, q_ref)
 
-    # --only_model: 모델만 실행 (baseline 재사용). 그 외엔 전체 6개 방법.
-    methods = ['Ours (g)', 'Ours (s)'] if args.only_model else list(METHODS)
+    # --only_model: 모델(Ours g/s)만 실행하고 baseline(EST/Quality greedy/NSGA2/IABC)은
+    # test_results/comparison/ 캐시에서 로드해 비교군으로 표시. 그 외엔 전체 6개 방법 실행.
+    run_methods = ['Ours (g)', 'Ours (s)'] if args.only_model else list(METHODS)
 
     # ── IABC pop/gen: runtime 을 NSGA2 에 맞추도록 평가 예산(개체 평가 횟수) 정렬 ──
     # NSGA2 = pop·(gen+1) 평가,  IABC ≈ pop·(1+2·gen) 평가(employed+onlooker, scout 무시).
@@ -489,15 +553,37 @@ def main():
         nsga_evals = args.nsga_pop * (args.nsga_gen + 1)
         iabc_gen = max(1, round((nsga_evals / iabc_pop - 1) / 2))
 
+    # ── baseline 결과 캐시 (test_results/comparison/) 설정 ──
+    # meta = 캐시 무효화 키: 이 키들이 모두 같아야 다른 run 의 baseline 점을 재사용해도 IGD+ 가
+    # 전체 run 과 정합한다 (HV/Makespan/Quality 는 anchor 절대값이라 무관).
+    base_meta = {
+        'J': J, 'M': M, 'machines': machines,
+        'q_idx': args.q_idx, 'p_idx': args.p_idx,
+        'seed': args.seed, 'ga_seed': args.ga_seed, 'anchors': list(anchors),
+    }
+
+    def _cache_path(method):
+        return baseline_cache_path(method, J, M, args.nsga_pop, args.nsga_gen,
+                                   iabc_pop, iabc_gen)
+
+    # only_model 이면 캐시 파일이 있는 baseline 만 비교군으로 추가.
+    loaded_baselines = [b for b in BASELINES
+                        if args.only_model and os.path.exists(_cache_path(b))]
+    # 표/플롯에 보일 방법 = 실행 방법 ∪ 로드된 baseline (METHODS 순서 유지).
+    display_methods = [m for m in METHODS if m in run_methods or m in loaded_baselines]
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.manual_seed(args.seed)
     print(f"[table] device={device}  W={J}  machines={machines}  "
-          f"(Q{args.q_idx},P{args.p_idx})  paths={paths_idx_list}  "
-          f"yield_mode={args.yield_mode}")
+          f"(Q{args.q_idx},P{args.p_idx})  paths={paths_idx_list}")
     print(f"[table] anchors: m=[best={m_best}, ref={m_ref}]  q=[ref={q_ref}, best={q_best}]")
     if args.only_model:
-        print(f"[table] Ours only: λ×{args.num_lambdas}, samples/λ={args.samples}  "
-              f"(EST/Quality greedy/NSGA2/IABC 건너뜀)")
+        print(f"[table] Ours only: λ×{args.num_lambdas}, samples/λ={args.samples}")
+        if loaded_baselines:
+            print(f"[table] baseline 캐시 로드: {loaded_baselines}  (from {COMPARISON_DIR}/)")
+        else:
+            print(f"[table] baseline 캐시 없음 — Ours 만 표시. (먼저 --only_model 없이 전체 "
+                  f"run 하면 {COMPARISON_DIR}/ 에 저장됨)")
     else:
         print(f"[table] Ours: λ×{args.num_lambdas}, samples/λ={args.samples}  |  "
               f"NSGA-II: pop={args.nsga_pop}, gen={args.nsga_gen}  (yield=ground-truth only)")
@@ -525,33 +611,56 @@ def main():
 
     # ── path 별 평가 ──
     agg = {m: {'HV': [], 'IGD+': [], 'Makespan': [], 'Quality': [], 'Time': []}
-           for m in methods}
+           for m in display_methods}
     last_pts = None
     for paths_idx in paths_idx_list:
         print(f"\n========== paths_{paths_idx} ==========")
         outputs, _ = evaluate_one_path(
             env=env, model=model, env_edge_lookup_t=env_edge_lookup_t, device=device,
             problems_INT_list=problems_INT_list, machines=machines, J=J, S=S,
-            q_idx=args.q_idx, paths_idx=paths_idx, yield_mode=args.yield_mode,
+            q_idx=args.q_idx, paths_idx=paths_idx,
             anchors=anchors, seed=args.seed, ga_seed=args.ga_seed,
             wq_min=wq_min, wq_max=wq_max,
             num_lambdas=args.num_lambdas, samples=args.samples,
             nsga_pop=args.nsga_pop, nsga_gen=args.nsga_gen,
             iabc_pop=iabc_pop, iabc_gen=iabc_gen, iabc_limit=args.iabc_limit,
             iabc_p_global=args.iabc_p_global, iabc_archive_cap=args.iabc_archive_cap,
-            methods=methods)
+            methods=run_methods)
+
+        # 실행한 baseline 은 test_results/comparison/ 에 저장 → 다음 --only_model run 에서 재사용.
+        for name in run_methods:
+            if name in BASELINES:
+                bms, byld, bt = outputs[name]
+                save_baseline_cache(_cache_path(name), paths_idx, bms, byld, bt,
+                                    _baseline_meta(name, base_meta, args.nsga_pop,
+                                                   args.nsga_gen, iabc_pop, iabc_gen))
+
+        # only_model: 캐시된 baseline 점을 이 path 에 대해 로드해 비교군으로 병합.
+        for name in loaded_baselines:
+            entry, meta = load_baseline_cache(_cache_path(name), paths_idx)
+            if entry is None:
+                print(f"  [warn] {name}: paths_{paths_idx} 캐시 엔트리 없음 → 이 path 건너뜀")
+                continue
+            bad = cache_meta_mismatch(meta, _baseline_meta(
+                name, base_meta, args.nsga_pop, args.nsga_gen, iabc_pop, iabc_gen))
+            if bad:
+                print(f"  [warn] {name}: 캐시 meta 불일치 {bad} — IGD+ 가 전체 run 과 어긋날 수 있음")
+            outputs[name] = entry
+
+        # 이 path 에서 점이 있는 방법만 집계(누락 baseline 은 자동 제외).
+        present = [m for m in display_methods if m in outputs]
 
         # 1st pass: 방법별 독립 지표(HV/Makespan/Quality) + 점집합 수집.
         last_pts = {}
         md_all = {}
-        for name in methods:
+        for name in present:
             ms, yld, t = outputs[name]
             md_all[name] = (compute_metrics(ms, yld, anchors), t)
             last_pts[name] = (ms, yld)
 
-        # 2nd pass: 실행한 방법 점을 합쳐 best-known front → 방법별 IGD+ (공통 기준 필요).
+        # 2nd pass: 실행/로드한 방법 점을 합쳐 best-known front → 방법별 IGD+ (공통 기준 필요).
         ref_front = build_reference_front(last_pts, anchors)
-        for name in methods:
+        for name in present:
             md, t = md_all[name]
             ms, yld = last_pts[name]
             igd = igd_plus_metric(ms, yld, ref_front, anchors)
@@ -566,13 +675,12 @@ def main():
                   f"|pts|={np.asarray(ms).size}")
 
     # ── 표 출력 + 저장 ──
-    header = (f"N={J}, M={machines}, (Q{args.q_idx},P{args.p_idx}), "
-              f"yield={args.yield_mode}")
-    table_str, rows = build_table(agg, header, len(paths_idx_list), methods)
+    header = f"N={J}, M={machines}, (Q{args.q_idx},P{args.p_idx})"
+    table_str, rows = build_table(agg, header, len(paths_idx_list), display_methods)
     print(table_str)
 
     suffix = '_model' if args.only_model else ''
-    args.out = f'test_results/J{J}_M{sum(machines)}_table{suffix}'
+    args.out = f'test_results/J{J}_M{M}_table{suffix}'
     csv_path = f"{args.out}.csv"
     try:
         import pandas as pd
@@ -584,7 +692,8 @@ def main():
     if not args.no_plot and len(paths_idx_list) == 1 and last_pts is not None:
         png_path = f"{args.out}.png"
         plot_fronts(last_pts, anchors, png_path,
-                    title=f"{header}  paths_{paths_idx_list[0]}", methods=methods)
+                    title=f"{header}  paths_{paths_idx_list[0]}",
+                    methods=[m for m in display_methods if m in last_pts])
         print(f"saved -> {png_path}")
 
 

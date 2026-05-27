@@ -644,14 +644,14 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(
         description="HFSP Pareto overlay (Ours/model + Comparison 1/2 + EST). "
                     "기본 mode=batch: run_all.bat 의 6개 config 를 percentile 로 순차 실행.")
-    p.add_argument('--mode',        type=str, default='batch', choices=['batch', 'single'],
+    p.add_argument('--mode',        type=str, default='single', choices=['batch', 'single'],
                    help="'batch'(기본)=6개를 한 그림(2x3, 윗줄 J15·아랫줄 J25)으로 합본 저장, "
                         "'single'=1개만.")
-    p.add_argument('--ckpt',        type=str, default='checkpoints/saved_0,1_0526.pt')
+    p.add_argument('--ckpt',        type=str, default='checkpoints/0527_pbi.pt')
     p.add_argument('--num_jobs',    type=int, default=25, help="single mode 전용.")
     p.add_argument('--machines',    type=str, default='5,3,7,3,5,7')
     p.add_argument('--num_lambdas', type=int, default=32, help='λ grid 크기. linspace(0,1,N).')
-    p.add_argument('--samples',     type=int, default=8,
+    p.add_argument('--samples',     type=int, default=64,
                    help='λ 당 trajectory 수. >1 = stochastic sampling (run_all.bat SAMPLES=8), 1 = greedy.')
     p.add_argument('--p_idx',       type=int, choices=[1, 2, 3], default=3, help="single mode 전용.")
     p.add_argument('--q_idx',       type=int, choices=[1, 2, 3], default=3, help="single mode 전용.")
@@ -663,10 +663,10 @@ if __name__ == "__main__":
                         "batch 는 config 별 ylim 사용. percentile 은 0~100 스케일. "
                         "HV anchor q=[ref=lo, best=hi] (percentile 은 0~100 강제).")
     p.add_argument('--wafer_quality', type=str, default='0.99,1.00',
-                   help="초기 웨이퍼 품질 U[lo,hi]. (예: '0.99,1.00')")
+                   help="초기 웨이퍼 품질 U[lo,hi]. (예: '0.99,1.00')") # 유리하게 하려면 1 고정이 나을수도
     p.add_argument('--comp_seed',   type=int, default=0,
                    help="비교군 랜덤 front 생성 seed (실데이터 주입 전까지만 의미).")
-    p.add_argument('--thin',        type=float, default=0.3,
+    p.add_argument('--thin',        type=float, default=0,
                    help="Ours 프런티어에서 서로 가까운 점 솎기 강도 0~1. "
                         "0=미적용(전부), 1=적당히 많이 제거.")
     p.add_argument('--out',         type=str, default='',
