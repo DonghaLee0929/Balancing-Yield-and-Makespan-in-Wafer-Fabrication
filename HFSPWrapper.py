@@ -15,13 +15,25 @@ from HFSPGraphEnv import HFSPGraphEnv
 from FFSPModel import FFSPModel
 
 # =====================================================
-# Scalarization toggle (SIL best-P selection 보상)
+# Scalarization mode (SIL best-P selection 보상)
 # =====================================================
 # sil_pomo_rollout 에서 (m_hat, q_hat) ∈ [0,1] (1=best, ideal=(1,1)) 를 스칼라화하는 방식.
-#   None  → 일반 선형 가중합:        r = (1-λ)·m_hat + λ·q_hat
-#   True  → 순수 (weighted) Tchebycheff: r = -max((1-λ)(1-m_hat), λ(1-q_hat))
-#   float → 증강(augmented) Tchebycheff:  위 식 - ρ·((1-λ)(1-m_hat) + λ(1-q_hat))
-TCHEBYCHEFF = None
+# 비용 좌표 e = (e_m, e_q) = (1-m_hat, 1-q_hat) ≥ 0  → ideal 코너가 곧 원점 z*=(0,0).
+# 가중치 벡터 λ_vec = (w_m, w_q) = (1-λ, λ)  (MOEA/D 처럼 L1-정규화: w_m+w_q=1).
+#
+#   'ws'   선형 가중합              : r = (1-λ)·m_hat + λ·q_hat
+#   'tch'  (augmented) Tchebycheff  : r = -max((1-λ)·e_m, λ·e_q) [ - ρ·((1-λ)·e_m + λ·e_q) ]
+#                                     ρ = TCH_RHO (0 이면 순수 Tchebycheff)
+#   'pbi'  PBI (MOEA/D, 논문 Eq.24) : r = -(d1 + α·d2),  z*=원점(=ideal) 기준 최소화의 음수
+#            ray 방향 = (λ, 1-λ)  ← WS/TCH 와 *스왑* (PBI d2 정렬 특성상 안 그러면 λ 의미 반전)
+#            d1 = (e·ray)/‖ray‖                          … ray 방향 투영 길이
+#            d2 = ‖e - d1·raŷ‖,  raŷ = ray/‖ray‖          … λ-ray 로부터의 수직 이탈 거리
+#          α = PBI_ALPHA. ※ d2 항 덕분에 극단 λ(=0/1)에서도 '반대 목적' 기울기가 안 죽음
+#            (WS/TCH 가 극단 weight 에서 한 목적에 blind 해지는 문제를 정면 보완).
+#            α 너무 작으면(≈1) 양 극단 λ 가 한 점으로 degenerate → α≈2+ 권장.
+SCALARIZATION = 'ws'      # 'ws' | 'tch' | 'pbi'
+TCH_RHO       = 0.0       # augmented Tchebycheff 증강항 계수 ρ (0 = 순수 TCH)
+PBI_ALPHA     = 2.0       # PBI 수직거리 d2 벌점 계수 α (논문 Eq.24; 통상 0.1~5)
 
 # =====================================================
 # Feature channels
@@ -457,14 +469,31 @@ def sil_pomo_rollout(env: HFSPGraphEnv, model: FFSPModel,
     q_hat = (G_q - q_worst) / q_span
 
     w_m, w_q = (1.0 - lam_bp), lam_bp
-    if TCHEBYCHEFF is None:
-        r = w_m * m_hat + w_q * q_hat                       # 일반 가중합
-    else:
-        d_m = w_m * (1.0 - m_hat)                           # ideal(=1)까지 가중 거리
+    if SCALARIZATION == 'ws':
+        r = w_m * m_hat + w_q * q_hat                          # 선형 가중합
+    elif SCALARIZATION == 'tch':
+        d_m = w_m * (1.0 - m_hat)                             # ideal(=1)까지 가중 거리
         d_q = w_q * (1.0 - q_hat)
-        r = -torch.maximum(d_m, d_q)                        # 순수 Tchebycheff
-        if TCHEBYCHEFF is not True:                         # float → 증강항 ρ
-            r = r - float(TCHEBYCHEFF) * (d_m + d_q)
+        r = -torch.maximum(d_m, d_q)                          # (weighted) Tchebycheff
+        if TCH_RHO > 0.0:                                     # 증강항 ρ
+            r = r - float(TCH_RHO) * (d_m + d_q)
+    elif SCALARIZATION == 'pbi':
+        # PBI (MOEA/D / 논문 Eq.24). 비용 좌표 e = ideal 까지 거리 → z*=원점.
+        # min g = d1 + α·d2 → 보상 -g. d2(수직 벌점)가 극단 λ 에서도 반대 목적 기울기를 살림.
+        # ⚠ ray 가중치는 WS/TCH 와 *반대로* 짝짓는다: PBI 의 d2 는 ray 에 '정렬' 시키므로
+        #   ray 가 makespan 축이면 오히려 yield 를 0 으로 밀어(고yield) λ 의미가 뒤집힌다.
+        #   λ=0→makespan, λ=1→yield (WS 와 동일) 로 맞추려면 ray=(λ, 1-λ) 로 스왑.
+        #   (Eq.24 공식 자체는 불변 — 목적↔가중치 짝만 일관되게 정렬.)
+        a_m, a_q = lam_bp, (1.0 - lam_bp)                     # ray 방향 (WS 와 스왑)
+        e_m, e_q = (1.0 - m_hat), (1.0 - q_hat)
+        lam_norm = torch.sqrt(a_m * a_m + a_q * a_q) + 1e-8
+        d1 = (e_m * a_m + e_q * a_q) / lam_norm                # λ̂ 방향 투영 길이
+        uh_m, uh_q = a_m / lam_norm, a_q / lam_norm            # 단위 방향 λ̂
+        d2 = torch.sqrt((e_m - d1 * uh_m) ** 2
+                        + (e_q - d1 * uh_q) ** 2 + 1e-12)       # λ-ray 수직 이탈 거리
+        r = -(d1 + float(PBI_ALPHA) * d2)
+    else:
+        raise ValueError(f"unknown SCALARIZATION={SCALARIZATION!r} (use 'ws'|'tch'|'pbi')")
     r_bp = r.view(B, P)
 
     best_p_idx = r_bp.argmax(dim=1)

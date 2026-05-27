@@ -276,8 +276,8 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
             # linspace(0,1,101) pool 에서 B 개 인덱스를 균등 추출 → (B,) instance-level λ.
             lam_idx = torch.randint(0, lam_num, (B,), generator=gen, device=device)
             lambdas_b = lam_pool[lam_idx]
-            lambdas_b[0] = 0
-            lambdas_b[-1] = 1
+            # lambdas_b[0] = 0
+            # lambdas_b[-1] = 1
 
             # λ-conditioned SIL rollout — batch layout: B unique (scenario, λ) × P pomo samples.
             # 같은 (scenario, λ) 안 P 샘플의 reward 분산으로 POMO baseline 계산.
