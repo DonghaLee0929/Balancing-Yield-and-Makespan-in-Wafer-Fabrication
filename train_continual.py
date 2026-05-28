@@ -119,8 +119,8 @@ def main():
     p = argparse.ArgumentParser(
         description="웨이퍼 지속학습 이어학습 (train_ASIL.train 재사용). "
                     "타깃 기본 Q1, 작업시간 {3,4,5,6}. 매 에폭 ckpt 저장.")
-    # warm-start.
-    p.add_argument('--init_ckpt', type=str, default='',
+    # warm-start. # checkpoints/0523_baseline.pt
+    p.add_argument('--init_ckpt', type=str, default='checkpoints/0523_baseline.pt',
                    help="이어학습 시작 ckpt (소스 (P3,Q3) 정책). 비우면 fresh init(=scratch).")
     # 인스턴스 구조.
     p.add_argument('--num_jobs', type=int, default=25)
@@ -160,11 +160,10 @@ def main():
                    help="매 N 에폭마다 epoch_{e}.pt 저장. 기본 1 = 매 에폭.")
     p.add_argument('--save_dir', type=str, default='',
                    help="epoch_{e}.pt 저장 디렉터리. 비우면 자동 명명.")
-    # reward 정규화 anchor (train_ASIL __main__ 기본값과 동일).
-    p.add_argument('--hv_m_best', type=float, default=100.0)
-    p.add_argument('--hv_m_worst', type=float, default=500.0)
-    p.add_argument('--hv_q_best', type=float, default=0.85)
-    p.add_argument('--hv_q_worst', type=float, default=0.50)
+    p.add_argument('--hv_m_best', type=float, default=40.0)
+    p.add_argument('--hv_m_worst', type=float, default=160.0)
+    p.add_argument('--hv_q_best', type=float, default=0.97)
+    p.add_argument('--hv_q_worst', type=float, default=0.85)
     # WandB (기본 off — 짧은 이어학습 다회 실행 편의).
     p.add_argument('--wandb_do', default=False, help="truthy 면 WandB 로깅 활성.")
     p.add_argument('--wandb_project', type=str, default='hfsp-continual')
