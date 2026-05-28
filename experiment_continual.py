@@ -309,7 +309,7 @@ def plot_overlay(per_row_pts, anchors, save_path, title, rows):
 
 
 # =====================================================
-# 학습 곡선(sweep) 모드 — 행별 ckpt 디렉터리에서 epoch_{e}.pt 를 sweep
+# 학습 곡선(sweep) 모드 — train_continual.py 가 적재한 jsonl 캐시에서 행×epoch 점 읽기.
 # =====================================================
 def _setup_path(*, device, J, S, machines, q_idx, src_q_idx, paths_idx,
                 src_paths_idx, p_idx, wq_min, wq_max, mask_value, seed,
@@ -505,55 +505,48 @@ def write_curve_csv(curve_agg, static_agg, epoch_list, sweep_rows, csv_path):
 
 
 # =====================================================
-# 점 캐시 — (W,Q,P) 당 *2 파일*:
-#   continual_points_W{J}_Q{q}P{p}.jsonl       (매 epoch 한 줄 append, 점 데이터)
-#   continual_points_W{J}_Q{q}P{p}.meta.json   (그룹키 + artifacts, 가끔 rewrite)
-#
-# jsonl 한 줄 = {"path","slug","epoch","ms","yld","t"} 단일 점.
-#   - Append-only — 매 epoch I/O 가 그 한 줄(~30 KB) 뿐, 전체 rewrite 0
-#   - 자연 dedup — 같은 (path,slug,epoch) 가 다시 들어오면 load 시 *마지막 라인* 이 이김
-#   - 다른 row 안 만지면 그 라인 그대로 → 머지 위험 0 (실수로 wipe 불가능)
-#   - 사람이 즉시 inspect 가능 (`head -1 *.jsonl | jq` 또는 텍스트 에디터)
-#
-# 그룹키(model/nsga) 검증은 experiment_shift.py 패턴 그대로 — 한 그룹 설정이 바뀌면 그 그룹의
-# 캐시 hit 가 거부되고 새 점들이 append 됨. artifact (slug_e{epoch}: sig) 는 meta.json 에서
-# 일관 관리 — ckpt mtime/size 가 바뀌면 그 (행, epoch) 만 무효화.
+# 점 캐시 — 두 채널 분리:
+#   sweep 행(scratch/full-adapt/stale-feat/masked-feat) 곡선 점
+#     -> train_results/continual_<slug>_W{J}_Q{q}P{p}.jsonl
+#        train_continual.py 가 매 런 truncate 후 매 epoch 한 줄 append. 여기선 read-only.
+#        한 파일 = 한 런 결과(트레이닝측에서 정해진 컨벤션).
+#   static 행(zero-shot/NSGA) 참조점
+#     -> test_results/comparison/continual_static_W{J}_Q{q}P{p}.jsonl
+#        + .meta.json (model/nsga 그룹키 검증). 여기서 직접 적재/검증.
 # =====================================================
 _SWEEP_SLUG = {'scratch': 'scratch', 'full-adapt': 'fulladapt',
                'stale-feat': 'stalefeat', 'masked-feat': 'maskedfeat'}
 _STATIC_SLUG = {'zero-shot': 'zeroshot', 'NSGA': 'nsga'}
 
-
-def _artifact_sig(path):
-    """ckpt 파일 정체성 — 경로+mtime+size. 재학습돼 파일 바뀌면 키가 달라져 자동 무효화."""
-    if not path:
-        return None
-    try:
-        st = os.stat(path)
-        return {'path': str(path), 'mtime': float(st.st_mtime), 'size': int(st.st_size)}
-    except OSError:
-        return {'path': str(path), 'mtime': None, 'size': None}
+TRAIN_RESULTS_DIR = 'train_results'
 
 
-def _continual_cache_path(J, q_idx, p_idx):
-    return os.path.join(COMPARISON_DIR, f"continual_points_W{J}_Q{q_idx}P{p_idx}.jsonl")
+def _sweep_jsonl_path(slug, J, q_idx, p_idx):
+    return os.path.join(TRAIN_RESULTS_DIR,
+                        f"continual_{slug}_W{J}_Q{q_idx}P{p_idx}.jsonl")
 
 
-def _continual_meta_path(J, q_idx, p_idx):
-    return os.path.join(COMPARISON_DIR, f"continual_points_W{J}_Q{q_idx}P{p_idx}.meta.json")
+def _static_cache_path(J, q_idx, p_idx):
+    return os.path.join(COMPARISON_DIR,
+                        f"continual_static_W{J}_Q{q_idx}P{p_idx}.jsonl")
+
+
+def _static_meta_path(J, q_idx, p_idx):
+    return os.path.join(COMPARISON_DIR,
+                        f"continual_static_W{J}_Q{q_idx}P{p_idx}.meta.json")
 
 
 def _build_cur_metas(*, args, machines, wq_min, wq_max, anchors):
-    """검증키 두 그룹 — model 행(λ-sweep)·nsga 행 각각이 점에 영향받는 설정만 담는다.
-    artifact 는 여기 안 들어가고 meta.json 의 별도 dict 로 관리(=세밀 부분 무효화)."""
+    """static(zero-shot/NSGA) 캐시 검증키. sweep 행은 train_results 에서 read-only 라 검증 안 함.
+
+    'model' 그룹 = zero-shot 정책 eval 에 영향주는 설정.
+    'nsga'  그룹 = NSGA-II 에 영향주는 설정.
+    """
     base = {'J': int(args.num_jobs), 'base_machines': list(machines),
             'q_idx': int(args.q_idx), 'p_idx': int(args.p_idx),
             'wq_min': float(wq_min), 'wq_max': float(wq_max),
             'yield_mode': str(args.yield_mode)}
-    model = {**base, 'src_q_idx': int(args.src_q_idx),
-             'src_paths_idx': int(args.src_paths_idx),
-             'mask_value': float(args.mask_value),
-             'num_lambdas': int(args.num_lambdas),
+    model = {**base, 'num_lambdas': int(args.num_lambdas),
              'samples': int(args.samples), 'seed': int(args.seed)}
     nsga = {**base, 'nsga_pop': int(args.nsga_pop), 'nsga_gen': int(args.nsga_gen),
             'ga_seed': int(args.ga_seed),
@@ -561,15 +554,38 @@ def _build_cur_metas(*, args, machines, wq_min, wq_max, anchors):
     return {'model': model, 'nsga': nsga}
 
 
-def _load_continual_cache(J, q_idx, p_idx):
-    """jsonl + meta.json → (cache_data, file_meta). 파일 없으면 빈 값.
+def _load_sweep_points(J, q_idx, p_idx, sweep_rows):
+    """train_results/ 의 per-row jsonl 들을 합쳐 cache_data dict 로. 없는 파일은 자연 스킵.
 
-    cache_data 형식은 dict {'p{path}_{slug}_e{epoch}_{ms|yld|t}': np.array} — 옛 npz 인터페이스
-    그대로 유지해 downstream 코드 그대로 사용. 같은 (path,slug,epoch) 가 jsonl 에 여러 번
-    나오면 *나중 라인* 이 이김 (자연 dedup).
+    같은 (path,slug,epoch) 가 한 파일에 여러 번 나오면 *마지막 라인* 이 이김 (자연 dedup).
+    검증 메타 없음 — 트레이닝측이 truncate 컨벤션을 따른다고 신뢰.
     """
     cache_data = {}
-    jsonl_path = _continual_cache_path(J, q_idx, p_idx)
+    for r in sweep_rows:
+        slug = _SWEEP_SLUG[r]
+        path = _sweep_jsonl_path(slug, J, q_idx, p_idx)
+        if not os.path.exists(path):
+            continue
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    pk = f"p{int(rec['path'])}_{slug}_e{int(rec['epoch'])}"
+                    cache_data[f'{pk}_ms'] = np.asarray(rec['ms'], np.float32)
+                    cache_data[f'{pk}_yld'] = np.asarray(rec['yld'], np.float32)
+                    cache_data[f'{pk}_t'] = np.asarray(float(rec.get('t', 0.0)), np.float32)
+                except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+                    continue
+    return cache_data
+
+
+def _load_static_cache(J, q_idx, p_idx):
+    """static(zero-shot/NSGA) 점 캐시 + meta group keys."""
+    cache_data = {}
+    jsonl_path = _static_cache_path(J, q_idx, p_idx)
     if os.path.exists(jsonl_path):
         with open(jsonl_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -578,36 +594,28 @@ def _load_continual_cache(J, q_idx, p_idx):
                     continue
                 try:
                     rec = json.loads(line)
-                    path = int(rec['path'])
-                    slug = str(rec['slug'])
-                    epoch = int(rec['epoch'])
-                    pk = f'p{path}_{slug}_e{epoch}'
+                    pk = f"p{int(rec['path'])}_{rec['slug']}_e{int(rec['epoch'])}"
                     cache_data[f'{pk}_ms'] = np.asarray(rec['ms'], np.float32)
                     cache_data[f'{pk}_yld'] = np.asarray(rec['yld'], np.float32)
                     cache_data[f'{pk}_t'] = np.asarray(float(rec.get('t', 0.0)), np.float32)
                 except (json.JSONDecodeError, KeyError, ValueError, TypeError):
-                    continue                                  # 잘못된 라인은 무시
+                    continue
 
-    file_meta = {'groups': {}, 'artifacts': {}}
-    meta_path = _continual_meta_path(J, q_idx, p_idx)
+    file_groups = {}
+    meta_path = _static_meta_path(J, q_idx, p_idx)
     if os.path.exists(meta_path):
         try:
             with open(meta_path, 'r', encoding='utf-8') as f:
                 m = json.load(f)
-            file_meta['groups'] = {k: m[k] for k in ('model', 'nsga') if k in m}
-            file_meta['artifacts'] = m.get('artifacts', {}) or {}
+            file_groups = {k: m[k] for k in ('model', 'nsga') if k in m}
         except Exception:
             pass
+    return cache_data, file_groups
 
-    return cache_data, file_meta
 
-
-def _append_eval_record(J, q_idx, p_idx, paths_idx, slug, epoch, ms, yld, t):
-    """jsonl 에 *한 줄* append — 매 epoch I/O 가 ~수십 KB 한 줄 뿐, 전체 rewrite 0.
-
-    파일이 없으면 새로 만든다. 동시 쓰기 안 보호함 (한 머신에서 순차 실행 가정).
-    """
-    jsonl_path = _continual_cache_path(J, q_idx, p_idx)
+def _append_static_record(J, q_idx, p_idx, paths_idx, slug, epoch, ms, yld, t):
+    """static 캐시 jsonl 에 한 줄 append."""
+    jsonl_path = _static_cache_path(J, q_idx, p_idx)
     os.makedirs(os.path.dirname(jsonl_path) or '.', exist_ok=True)
     rec = {
         'path': int(paths_idx),
@@ -621,71 +629,40 @@ def _append_eval_record(J, q_idx, p_idx, paths_idx, slug, epoch, ms, yld, t):
         f.write(json.dumps(rec, ensure_ascii=False) + '\n')
 
 
-def _save_continual_meta(J, q_idx, p_idx, cur_metas, artifacts):
-    """meta.json rewrite (~수 KB) — group keys 와 artifacts. jsonl 과 분리해 lightweight."""
-    meta_path = _continual_meta_path(J, q_idx, p_idx)
+def _save_static_meta(J, q_idx, p_idx, cur_metas):
+    meta_path = _static_meta_path(J, q_idx, p_idx)
     os.makedirs(os.path.dirname(meta_path) or '.', exist_ok=True)
-    meta = {
-        'model': cur_metas['model'],
-        'nsga': cur_metas['nsga'],
-        'artifacts': artifacts,
-    }
+    meta = {'model': cur_metas['model'], 'nsga': cur_metas['nsga']}
     with open(meta_path, 'w', encoding='utf-8') as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
 
 
-def _cached_or_eval(*, slug, epoch, paths_idx, ckpt_path, group_ok, refresh,
-                    cache_data, file_artifacts, new_artifacts, compute_fn,
-                    J, q_idx, p_idx):
-    """캐시 hit → 즉시 반환, miss → compute_fn() 호출 후 jsonl 에 *한 줄 append*.
-
-    ckpt_path=None 이면 artifact 검증 생략 (NSGA: 그룹 키만으로 판별).
-    반환: (ms, yld, t, hit:bool). cache_data 도 in-memory 로 갱신 → 같은 run 안 후속 코드 일관.
+def _cached_or_eval_static(*, slug, epoch, paths_idx, group_ok, refresh,
+                           cache_data, compute_fn, J, q_idx, p_idx):
+    """static(zero-shot/NSGA) 전용: 캐시 hit → 즉시 반환, miss → compute_fn + static jsonl append.
+    반환: (ms, yld, t, hit:bool). cache_data 는 in-memory 갱신.
     """
     pk = f'p{paths_idx}_{slug}_e{epoch}'
-    art_key = f'{slug}_e{epoch}' if ckpt_path else None
-    cur_sig = _artifact_sig(ckpt_path) if ckpt_path else None
-    if art_key is not None:
-        # 파일이 사라진 경우 None sig 로 덮어쓰지 말고 이전 저장본 보존
-        # → 다음 재실행에서도 stored 가 살아 있어 캐시 hit 가능.
-        if cur_sig and cur_sig.get('mtime') is None and art_key in file_artifacts:
-            new_artifacts[art_key] = file_artifacts[art_key]
-        else:
-            new_artifacts[art_key] = cur_sig
-
-    # Cache hit
     if not refresh and group_ok and f'{pk}_ms' in cache_data:
-        artifact_ok = True
-        if art_key is not None:
-            stored = file_artifacts.get(art_key)
-            if stored is None:
-                artifact_ok = False
-            elif cur_sig and cur_sig.get('mtime') is None:
-                artifact_ok = True                          # ckpt 삭제됨 → 캐시 신뢰
-            else:
-                artifact_ok = (json.dumps(stored, sort_keys=True) ==
-                               json.dumps(cur_sig, sort_keys=True))
-        if artifact_ok:
-            ms = cache_data[f'{pk}_ms']
-            yld = cache_data[f'{pk}_yld']
-            t = float(cache_data[f'{pk}_t']) if f'{pk}_t' in cache_data else 0.0
-            return ms, yld, t, True
+        ms = cache_data[f'{pk}_ms']
+        yld = cache_data[f'{pk}_yld']
+        t = float(cache_data[f'{pk}_t']) if f'{pk}_t' in cache_data else 0.0
+        return ms, yld, t, True
 
-    # Cache miss — compute + append 한 줄
     ms, yld, t = compute_fn()
     ms_arr = np.asarray(ms, np.float32).ravel()
     yld_arr = np.asarray(yld, np.float32).ravel()
-    cache_data[f'{pk}_ms'] = ms_arr                          # in-memory 갱신
+    cache_data[f'{pk}_ms'] = ms_arr
     cache_data[f'{pk}_yld'] = yld_arr
     cache_data[f'{pk}_t'] = np.asarray(float(t), np.float32)
-    _append_eval_record(J, q_idx, p_idx, paths_idx, slug, epoch, ms_arr, yld_arr, t)
+    _append_static_record(J, q_idx, p_idx, paths_idx, slug, epoch, ms_arr, yld_arr, t)
     return ms_arr, yld_arr, t, False
 
 
 def run_sweep(*, args, machines, J, S, anchors, paths_idx_list, wq_min, wq_max,
               epoch_list, sweep_rows, run_nsga, device):
-    """학습 곡선 모드: jsonl 캐시 (train_continual.py 가 매 epoch 적재) 에서 sweep 점을 읽고
-    zero-shot/NSGA 참조점은 1회씩 평가. sweep 행은 ckpt 를 안 읽음 — jsonl 이 단일 소스.
+    """학습 곡선 모드: sweep 행 점은 train_results/ 의 per-row jsonl 에서 read-only,
+    zero-shot/NSGA 참조점은 test_results/comparison/ 의 static 캐시에서 검증 후 재사용·없으면 계산.
 
     반환: (curve_agg, static_agg). curve_agg[row][epoch][metric] = list(per-path).
     """
@@ -706,32 +683,24 @@ def run_sweep(*, args, machines, J, S, anchors, paths_idx_list, wq_min, wq_max,
     static_agg = {name: {'HV': [], 'IGD+': [], 'Makespan': [], 'Quality': [], 'Time': []}
                   for name in static_names}
 
-    # ── 점 캐시 로드 + 그룹 검증키 매치 ──
+    # ── 점 캐시 로드: sweep(read-only) + static(검증) 분리 ──
     cur_metas = _build_cur_metas(args=args, machines=machines, wq_min=wq_min, wq_max=wq_max,
                                  anchors=anchors)
-    cache_data, file_meta = _load_continual_cache(J, args.q_idx, args.p_idx)
-    file_groups = file_meta.get('groups', {})
-    file_artifacts = file_meta.get('artifacts', {})
+    sweep_cache = _load_sweep_points(J, args.q_idx, args.p_idx, sweep_rows)
+    static_cache, file_groups = _load_static_cache(J, args.q_idx, args.p_idx)
     refresh = bool(args.cache_refresh)
     model_ok = (not refresh) and not cache_meta_mismatch(file_groups.get('model'),
                                                           cur_metas['model'])
     nsga_ok = (not refresh) and not cache_meta_mismatch(file_groups.get('nsga'),
                                                          cur_metas['nsga'])
     if refresh:
-        print("[cache] --cache_refresh → 캐시 무시·재계산 (jsonl 에 새 라인 append)")
-    elif cache_data:
-        if not (model_ok or nsga_ok):
-            miss_m = cache_meta_mismatch(file_groups.get('model'), cur_metas['model'])
-            miss_n = cache_meta_mismatch(file_groups.get('nsga'), cur_metas['nsga'])
-            print(f"[cache] jsonl 있지만 그룹 키 mismatch — model:{miss_m[:3]} nsga:{miss_n[:3]} → 재계산 append")
-        else:
-            kinds = ([n for n in ('model', 'nsga') if (n == 'model' and model_ok) or
-                      (n == 'nsga' and nsga_ok)])
-            print(f"[cache] 활성 그룹: {kinds}  (file={_continual_cache_path(J, args.q_idx, args.p_idx)})")
-            print(f"[cache] 옛 점 {len(cache_data) // 3}개 로드 (jsonl 한 줄 = 한 점)")
-
-    # Append-only 라 미터치 슬러그는 jsonl 안 라인 그대로 살아있음 (preserve-merge 불필요).
-    new_artifacts = dict(file_artifacts)    # 옛 artifacts 출발점, 새 평가마다 갱신
+        print("[cache] --cache_refresh → static 캐시 무시·재계산 (sweep 은 항상 train_results read-only)")
+    else:
+        n_sweep = len(sweep_cache) // 3
+        n_static = len(static_cache) // 3
+        kinds = [n for n, ok in (('model', model_ok), ('nsga', nsga_ok)) if ok]
+        print(f"[cache] sweep 점 {n_sweep}개 (train_results)  |  "
+              f"static 점 {n_static}개 활성 그룹={kinds}")
 
     # ── 정책 lazy 로드 — 캐시 풀히트면 한 번도 안 부른다 ──
     _model_cache = {}               # name → loaded policy
@@ -765,13 +734,10 @@ def run_sweep(*, args, machines, J, S, anchors, paths_idx_list, wq_min, wq_max,
                 return _eval_policy(model, qh, env, env_edge_lookup_t, device,
                                     gq_tgt, proc, wq_1, args.num_lambdas, args.samples,
                                     args.seed, args.yield_mode)
-            ms, yld, t, hit = _cached_or_eval(
+            ms, yld, t, hit = _cached_or_eval_static(
                 slug=_STATIC_SLUG[name], epoch=-1, paths_idx=paths_idx,
-                ckpt_path=static_meta[name]['ckpt'],
                 group_ok=model_ok, refresh=refresh,
-                cache_data=cache_data, file_artifacts=file_artifacts,
-                new_artifacts=new_artifacts,
-                compute_fn=_compute_static,
+                cache_data=static_cache, compute_fn=_compute_static,
                 J=J, q_idx=args.q_idx, p_idx=args.p_idx)
             path_static_pts[name] = (ms, yld)
             md = compute_metrics(ms, yld, anchors)
@@ -789,12 +755,10 @@ def run_sweep(*, args, machines, J, S, anchors, paths_idx_list, wq_min, wq_max,
                     env, gq_tgt, proc, wq_1, list(machines), J, S, anchors,
                     args.nsga_pop, args.nsga_gen, args.ga_seed, args.yield_mode), device)
                 return msn, yldn, tn
-            ms, yld, t, hit = _cached_or_eval(
-                slug=_STATIC_SLUG['NSGA'], epoch=-1, paths_idx=paths_idx, ckpt_path=None,
+            ms, yld, t, hit = _cached_or_eval_static(
+                slug=_STATIC_SLUG['NSGA'], epoch=-1, paths_idx=paths_idx,
                 group_ok=nsga_ok, refresh=refresh,
-                cache_data=cache_data, file_artifacts=file_artifacts,
-                new_artifacts=new_artifacts,
-                compute_fn=_compute_nsga,
+                cache_data=static_cache, compute_fn=_compute_nsga,
                 J=J, q_idx=args.q_idx, p_idx=args.p_idx)
             path_static_pts['NSGA'] = (ms, yld)
             md = compute_metrics(ms, yld, anchors)
@@ -805,19 +769,19 @@ def run_sweep(*, args, machines, J, S, anchors, paths_idx_list, wq_min, wq_max,
             print(f"  NSGA          HV={md['HV']:.4f}  ms={md['Makespan']:.1f}  "
                   f"q={md['Quality']:.4f}  t={t:.2f}s{tag}")
 
-        # Sweep 행 × epoch — jsonl 캐시 only. 점이 없으면 그 (행, epoch) 는 스킵.
+        # Sweep 행 × epoch — train_results jsonl 캐시 only. 점이 없으면 그 (행, epoch) 는 스킵.
         # (train_continual.py 가 매 epoch 적재해두지 않은 행은 그래프에서 자연 제외.)
         path_curve_pts = {r: {} for r in sweep_rows}
         for e in epoch_list:
             parts = [f"  epoch {e:>4d}"]
             for r in sweep_rows:
                 pk = f'p{paths_idx}_{_SWEEP_SLUG[r]}_e{e}'
-                if f'{pk}_ms' not in cache_data:
+                if f'{pk}_ms' not in sweep_cache:
                     parts.append(f"{r}: -")
                     continue
-                ms = cache_data[f'{pk}_ms']
-                yld = cache_data[f'{pk}_yld']
-                t = float(cache_data[f'{pk}_t'])
+                ms = sweep_cache[f'{pk}_ms']
+                yld = sweep_cache[f'{pk}_yld']
+                t = float(sweep_cache[f'{pk}_t'])
                 path_curve_pts[r][e] = (ms, yld)
                 md = compute_metrics(ms, yld, anchors)
                 curve_agg[r][e]['HV'].append(md['HV'])
@@ -842,11 +806,11 @@ def run_sweep(*, args, machines, J, S, anchors, paths_idx_list, wq_min, wq_max,
             igd = igd_plus_metric(ms, yld, ref_front, anchors)
             static_agg[name]['IGD+'].append(igd)
 
-    # 최종 meta 저장 (점 데이터는 sweep 도중 jsonl 에 라인 단위로 이미 append 완료).
+    # 최종 meta 저장 (static 점은 sweep 도중 jsonl 에 라인 단위로 이미 append 완료).
     try:
-        _save_continual_meta(J, args.q_idx, args.p_idx, cur_metas, new_artifacts)
-        print(f"\nsaved -> {_continual_cache_path(J, args.q_idx, args.p_idx)}  (점 jsonl)")
-        print(f"saved -> {_continual_meta_path(J, args.q_idx, args.p_idx)}  (meta)")
+        _save_static_meta(J, args.q_idx, args.p_idx, cur_metas)
+        print(f"\nsaved -> {_static_cache_path(J, args.q_idx, args.p_idx)}  (static 점 jsonl)")
+        print(f"saved -> {_static_meta_path(J, args.q_idx, args.p_idx)}  (static meta)")
     except Exception as e:
         print(f"[warn] meta 저장 실패: {e}")
 
