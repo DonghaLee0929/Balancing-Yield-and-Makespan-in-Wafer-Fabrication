@@ -644,10 +644,10 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(
         description="HFSP Pareto overlay (Ours/model + Comparison 1/2 + EST). "
                     "기본 mode=batch: run_all.bat 의 6개 config 를 percentile 로 순차 실행.")
-    p.add_argument('--mode',        type=str, default='single', choices=['batch', 'single'],
+    p.add_argument('--mode',        type=str, default='batch', choices=['batch', 'single'],
                    help="'batch'(기본)=6개를 한 그림(2x3, 윗줄 J15·아랫줄 J25)으로 합본 저장, "
                         "'single'=1개만.")
-    p.add_argument('--ckpt',        type=str, default='checkpoints/0527_pbi.pt')
+    p.add_argument('--ckpt',        type=str, default='checkpoints/0528_baseline.pt')
     p.add_argument('--num_jobs',    type=int, default=25, help="single mode 전용.")
     p.add_argument('--machines',    type=str, default='5,3,7,3,5,7')
     p.add_argument('--num_lambdas', type=int, default=32, help='λ grid 크기. linspace(0,1,N).')

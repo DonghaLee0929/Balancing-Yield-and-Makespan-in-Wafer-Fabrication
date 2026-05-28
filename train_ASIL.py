@@ -157,8 +157,8 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
           # ── 아래는 train_continual.py 용 선택 인자 (모두 default = 기존 동작 그대로) ──
           init_ckpt=None,          # 주어지면 그 ckpt 가중치로 warm-start (이어학습). 없으면 fresh init.
           quality_helper=None,     # 주어지면 그대로 사용(피처/보상 예측기 주입). 없으면 Q_3/paths_1 로드.
-          epoch_ckpt_dir=None,     # 주어지면 매 save_interval 에폭마다 epoch_{e}.pt 저장 (학습곡선용).
-          save_interval=0,         # 0 = 매-에폭 저장 안 함(기존 동작). 1 = 매 에폭.
+          post_epoch_hook=None,    # 주어지면 매 에폭 끝에 hook(epoch, model) 호출.
+                                   # train_continual.py 가 매 epoch 직접 eval → jsonl 캐시 적재용.
           ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.manual_seed(seed)
@@ -355,18 +355,12 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
         optimizer.step()
         scheduler.step()
 
-        # ── (옵션) 매 save_interval 에폭마다 ckpt 저장 — continual 학습곡선용 ──
-        # 아래 eval-시점 best-HV 저장과 별개로, step 직후 가중치를 epoch_{e}.pt 로 남긴다.
-        if epoch_ckpt_dir and save_interval > 0 and epoch % save_interval == 0:
-            os.makedirs(epoch_ckpt_dir, exist_ok=True)
-            torch.save({
-                'model': model.state_dict(),
-                'row_feat_dim': row_feat_dim,
-                'col_feat_dim': col_feat_dim,
-                'edge_feat_dim': edge_feat_dim,
-                'model_params': model_params,
-                'epoch': epoch,
-            }, os.path.join(epoch_ckpt_dir, f'epoch_{epoch}.pt'))
+        # ── (옵션) 매 에폭 끝 hook — 매 에폭 직접 eval → 캐시 적재 등 ──
+        if post_epoch_hook is not None:
+            try:
+                post_epoch_hook(epoch, model)
+            except Exception as e:
+                print(f"[warn] post_epoch_hook 실패 (epoch={epoch}): {e}")
 
         loss_mean = torch.stack(loss_buf).mean().item()
         avg_ms = torch.stack(ms_avg_buf).mean().item()
@@ -434,17 +428,19 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
                 best_eval = hv_mean
                 log_msg += " ← best"
 
-            os.makedirs(os.path.dirname(ckpt_path) or '.', exist_ok=True)
-            torch.save({
-                'model': model.state_dict(),
-                'row_feat_dim': row_feat_dim,
-                'col_feat_dim': col_feat_dim,
-                'edge_feat_dim': edge_feat_dim,
-                'model_params': model_params,
-                'best_hv': best_eval,
-                'hv_ref_m': HV_REF_M, 'hv_ref_q': HV_REF_Q,
-                'epoch': epoch,
-            }, ckpt_path)
+            # ckpt_path=None → best-HV ckpt 저장 생략.
+            if ckpt_path:
+                os.makedirs(os.path.dirname(ckpt_path) or '.', exist_ok=True)
+                torch.save({
+                    'model': model.state_dict(),
+                    'row_feat_dim': row_feat_dim,
+                    'col_feat_dim': col_feat_dim,
+                    'edge_feat_dim': edge_feat_dim,
+                    'model_params': model_params,
+                    'best_hv': best_eval,
+                    'hv_ref_m': HV_REF_M, 'hv_ref_q': HV_REF_Q,
+                    'epoch': epoch,
+                }, ckpt_path)
 
             eval_elapsed = time.time() - t_eval_start
             total_eval_time += eval_elapsed

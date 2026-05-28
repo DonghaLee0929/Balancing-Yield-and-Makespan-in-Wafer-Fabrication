@@ -286,11 +286,14 @@ def evaluate_one_path(*, env, model, env_edge_lookup_t, device,
                       wq_min, wq_max, num_lambdas, samples,
                       nsga_pop, nsga_gen,
                       iabc_pop, iabc_gen, iabc_limit, iabc_p_global, iabc_archive_cap,
-                      methods=None):
+                      methods=None, on_baseline_done=None):
     """단일 path 인스턴스에 대해 method -> (ms_array, yld_array, time_s) dict 반환.
 
     methods 로 실행할 방법만 골라 돌린다(None 이면 전체 METHODS). 예: ['Ours (g)',
     'Ours (s)'] 면 모델만 실행하고 EST/Quality greedy/NSGA2/IABC 는 건너뛴다.
+
+    on_baseline_done(name, ms, yld, t) 가 주어지면 EST/Quality greedy/NSGA2/IABC 각각
+    계산 직후 즉시 호출 — 뒤이은 Ours 추론에서 OOM 이 터져도 이미 끝난 GA 결과는 캐시에 남는다.
     """
     methods = methods or METHODS
     m_best, m_ref, q_best, q_ref = anchors
@@ -319,12 +322,16 @@ def evaluate_one_path(*, env, model, env_edge_lookup_t, device,
             problems_INT_list, wq_1, torch.zeros(1, device=device),
             1, 1, seed, True, method='est'), device)
         outputs['EST'] = (ms, yld, t)
+        if on_baseline_done is not None:
+            on_baseline_done('EST', ms, yld, t)
 
     # ── Quality greedy (단일 점, λ 무관) ──
     if 'Quality greedy' in methods:
         (ms, yld), t = timed(lambda: run_quality_greedy(
             env, qh, scorer, problems_INT_list, wq_1, seed, device), device)
         outputs['Quality greedy'] = (ms, yld, t)
+        if on_baseline_done is not None:
+            on_baseline_done('Quality greedy', ms, yld, t)
 
     # ── NSGA-II / IABC 공통 decoder 입력 (둘 중 하나라도 돌릴 때만 준비) ──
     if 'NSGA2' in methods or 'IABC' in methods:
@@ -347,6 +354,8 @@ def evaluate_one_path(*, env, model, env_edge_lookup_t, device,
 
         (ms, yld), t = timed(_run_nsga, device)
         outputs['NSGA2'] = (ms, yld, t)
+        if on_baseline_done is not None:
+            on_baseline_done('NSGA2', ms, yld, t)
 
     # ── IABC (Improved Artificial Bee Colony; NSGA2 와 동일 decoder/인스턴스) ──
     # 외부 Pareto archive(비지배 front)를 결과 점집합으로 사용. cycle 수(iabc_gen)는
@@ -366,6 +375,8 @@ def evaluate_one_path(*, env, model, env_edge_lookup_t, device,
 
         (ms, yld), t = timed(_run_iabc, device)
         outputs['IABC'] = (ms, yld, t)
+        if on_baseline_done is not None:
+            on_baseline_done('IABC', ms, yld, t)
 
     # ── Ours (greedy) — λ-sweep, samples=1 ──
     if 'Ours (g)' in methods:
@@ -488,9 +499,9 @@ def _parse_idx_spec(s: str) -> list[int]:
 # 20,12,28,12,20,28
 def main():
     p = argparse.ArgumentParser(description="HFSP 방법 비교 표.")
-    p.add_argument('--ckpt', type=str, default='checkpoints/0523_baseline.pt')
-    p.add_argument('--num_jobs', type=int, default=25)
-    p.add_argument('--machines', type=str, default='5,3,7,3,5,7',
+    p.add_argument('--ckpt', type=str, default='checkpoints/0528_baseline.pt')
+    p.add_argument('--num_jobs', type=int, default=100)
+    p.add_argument('--machines', type=str, default='20,12,28,12,20,28',
                    help="stage별 머신 수. stage 수는 CSV의 6 고정. base(5,3,7,3,5,7) 초과 시 "
                         "(m%%base) 복제 증강(2배=동일 인자 2벌), 미만 시 앞쪽 subset. 예: '10,6,14,6,10,14'.")
     p.add_argument('--p_idx', type=int, default=3, choices=[1, 2, 3])
@@ -498,9 +509,9 @@ def main():
     p.add_argument('--paths_idx', type=str, default='1',
                    help="historical_paths 인덱스. '1' / '1~10' / '1,3,5'. 여러 개면 path 평균.")
     p.add_argument('--num_lambdas', type=int, default=32, help="Ours 의 λ grid 크기.")
-    p.add_argument('--samples', type=int, default=64, help="Ours (s) 의 λ 당 sample 수.")
+    p.add_argument('--samples', type=int, default=8, help="Ours (s) 의 λ 당 sample 수.")
     p.add_argument('--nsga_pop', type=int, default=100)
-    p.add_argument('--nsga_gen', type=int, default=300)
+    p.add_argument('--nsga_gen', type=int, default=100)
     p.add_argument('--iabc_pop', type=int, default=0,
                    help="IABC food source 수 SN. 0 이면 nsga_pop 와 동일.")
     p.add_argument('--iabc_gen', type=int, default=0,
@@ -615,6 +626,14 @@ def main():
     last_pts = None
     for paths_idx in paths_idx_list:
         print(f"\n========== paths_{paths_idx} ==========")
+
+        # baseline 은 계산 직후 즉시 test_results/comparison/ 에 저장 → 뒤이은 Ours 추론에서
+        # OOM 이 터져도 이 path 의 GA 결과는 캐시에 남아 다음 --only_model run 에서 재사용.
+        def _save_baseline(name, ms, yld, t, _pi=paths_idx):
+            save_baseline_cache(_cache_path(name), _pi, ms, yld, t,
+                                _baseline_meta(name, base_meta, args.nsga_pop,
+                                               args.nsga_gen, iabc_pop, iabc_gen))
+
         outputs, _ = evaluate_one_path(
             env=env, model=model, env_edge_lookup_t=env_edge_lookup_t, device=device,
             problems_INT_list=problems_INT_list, machines=machines, J=J, S=S,
@@ -625,15 +644,7 @@ def main():
             nsga_pop=args.nsga_pop, nsga_gen=args.nsga_gen,
             iabc_pop=iabc_pop, iabc_gen=iabc_gen, iabc_limit=args.iabc_limit,
             iabc_p_global=args.iabc_p_global, iabc_archive_cap=args.iabc_archive_cap,
-            methods=run_methods)
-
-        # 실행한 baseline 은 test_results/comparison/ 에 저장 → 다음 --only_model run 에서 재사용.
-        for name in run_methods:
-            if name in BASELINES:
-                bms, byld, bt = outputs[name]
-                save_baseline_cache(_cache_path(name), paths_idx, bms, byld, bt,
-                                    _baseline_meta(name, base_meta, args.nsga_pop,
-                                                   args.nsga_gen, iabc_pop, iabc_gen))
+            methods=run_methods, on_baseline_done=_save_baseline)
 
         # only_model: 캐시된 baseline 점을 이 path 에 대해 로드해 비교군으로 병합.
         for name in loaded_baselines:

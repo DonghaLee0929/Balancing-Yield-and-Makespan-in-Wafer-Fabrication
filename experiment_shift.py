@@ -30,6 +30,7 @@ experiment_table.py 의 평가 코드를 그대로 import 해 수치가 그 스�
 from __future__ import annotations
 import os
 import sys
+import json
 import argparse
 
 # 로컬 test.py 가 stdlib `test` 패키지에 가려지지 않도록 스크립트 디렉터리를 최우선에.
@@ -44,6 +45,17 @@ for _stream in (sys.stdout, sys.stderr):
 
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+
+# 그림 폰트를 experiment_pareto.py 와 동일하게 STIX serif (Times 류, ↑/↓/λ 글리프 풀 커버).
+plt.rcParams.update({
+    'font.family': 'serif',
+    'font.serif': ['STIXGeneral', 'Times New Roman', 'DejaVu Serif'],
+    'mathtext.fontset': 'stix',
+})
 
 from HFSPGraphEnv import HFSPGraphEnv
 from FFSPModel import FFSPModel
@@ -190,29 +202,103 @@ def make_quality_helper(zip_path, num_stages, device):
 
 
 # =====================================================
-# NSGA 결과 캐시 — 느린 NSGA front 점을 시나리오별 test_results/comparison/ 에 저장,
-# 키(meta) 일치 시 재실행에서 로드해 재계산을 건너뛴다. experiment_table 의 캐시 머신 재사용.
+# 캐시 — 시나리오당 1개 npz(shift_points_s{n}_W{J}.npz)에 행별·path별 점 저장.
+# 키(meta)를 model(pred/gt)·nsga 두 그룹으로 나눠 한쪽 설정이 바뀌어도 다른 쪽 점은 보존.
+# meta 없는 옛 번들({slug}_ms concat)은 '설정 동일' 로 신뢰해 그대로 재사용(재계산 0).
 # =====================================================
-def nsga_cache_path(scenario, J, machines_eff, nsga_pop, nsga_gen, s1_delta):
-    """시나리오·인스턴스·pop/gen 별 npz 경로. s1_delta 는 scenario 1 에서만 front 에 영향 → 파일명에 포함."""
-    mtag = '-'.join(str(m) for m in machines_eff)
-    extra = f"_d{s1_delta:g}" if scenario == 1 else ""
-    return os.path.join(
-        COMPARISON_DIR,
-        f"shift_NSGA_s{scenario}{extra}_pop{nsga_pop}_gen{nsga_gen}_J{J}M{mtag}.npz")
+ROW_SLUG = {'pred=base': 'predbase', 'pred=shift': 'predshift',
+            'gt=shift': 'gtshift', 'NSGA (GT)': 'nsga'}
+ROW_GROUP = {'pred=base': 'model', 'pred=shift': 'model',
+             'gt=shift': 'model', 'NSGA (GT)': 'nsga'}
 
 
-def nsga_cache_meta(*, scenario, s1_delta, q_idx, p_idx, J, base_machines, machines_eff,
-                    nsga_pop, nsga_gen, ga_seed, yield_mode, wq_min, wq_max, seed, anchors):
-    """캐시 무효화 키 — NSGA 출력 점에 영향을 주는 모든 설정. 하나라도 다르면 재계산."""
-    return {
-        'scenario': int(scenario), 's1_delta': float(s1_delta),
-        'q_idx': int(q_idx), 'p_idx': int(p_idx), 'J': int(J),
-        'base_machines': list(base_machines), 'machines_eff': list(machines_eff),
-        'nsga_pop': int(nsga_pop), 'nsga_gen': int(nsga_gen), 'ga_seed': int(ga_seed),
-        'yield_mode': str(yield_mode), 'wq_min': float(wq_min), 'wq_max': float(wq_max),
-        'seed': int(seed), 'anchors': [float(a) for a in anchors],
-    }
+def effective_machines(scenario, base_machines):
+    """build_shifted_instance 가 만들 machine_cnt_list 를 모델 로드 없이 미리 계산.
+    시나리오 3 은 마지막 stage 머신 1개 제거(-1), 그 외는 base 그대로."""
+    m = list(base_machines)
+    if scenario == 3:
+        m[-1] -= 1
+    return m
+
+
+def _artifact_sig(path):
+    """캐시 키용 아티팩트 식별자 — 경로+mtime+size. 파일이 바뀌면(재학습) 키가 달라져 무효화."""
+    try:
+        st = os.stat(path)
+        return {'path': str(path), 'mtime': float(st.st_mtime), 'size': int(st.st_size)}
+    except OSError:
+        return {'path': str(path), 'mtime': None, 'size': None}
+
+
+def cache_group_metas(*, scenario, s1_delta, q_idx, p_idx, J, base_machines, machines_eff,
+                      num_lambdas, samples, seed, ga_seed, yield_mode, wq_min, wq_max, anchors,
+                      nsga_pop, nsga_gen, ckpt_base, pred_base_zip, pred_shift_zip, gt_ckpt):
+    """model(pred/gt)·nsga 두 그룹의 무효화 키. 각 그룹 점에 영향 주는 설정만 담는다."""
+    base = {'scenario': int(scenario), 's1_delta': float(s1_delta),
+            'q_idx': int(q_idx), 'p_idx': int(p_idx), 'J': int(J),
+            'base_machines': list(base_machines), 'machines_eff': list(machines_eff),
+            'yield_mode': str(yield_mode), 'wq_min': float(wq_min), 'wq_max': float(wq_max)}
+    model = {**base, 'num_lambdas': int(num_lambdas), 'samples': int(samples), 'seed': int(seed),
+             'artifacts': {'ckpt_base': _artifact_sig(ckpt_base),
+                           'pred_base': _artifact_sig(pred_base_zip),
+                           'pred_shift': _artifact_sig(pred_shift_zip),
+                           'gt_ckpt': _artifact_sig(gt_ckpt)}}
+    nsga = {**base, 'nsga_pop': int(nsga_pop), 'nsga_gen': int(nsga_gen),
+            'ga_seed': int(ga_seed), 'seed': int(seed), 'anchors': [float(a) for a in anchors]}
+    return {'model': model, 'nsga': nsga}
+
+
+def scenario_cache_path(scenario, J):
+    """시나리오당 캐시 파일 (옛 plot 번들과 동일 경로 → 기존 점 그대로 재사용)."""
+    return os.path.join(COMPARISON_DIR, f"shift_points_s{scenario}_W{J}.npz")
+
+
+def load_scenario_cache(scenario, J):
+    """→ (data {key:array}, group_metas {'model':..,'nsga':..} 또는 {}=옛 번들). 없으면 ({},{})."""
+    path = scenario_cache_path(scenario, J)
+    if not os.path.exists(path):
+        return {}, {}
+    with np.load(path, allow_pickle=True) as z:
+        data = {k: z[k] for k in z.files}
+    metas = {}
+    if 'meta' in data:
+        try:
+            metas = json.loads(str(data['meta'].item()))
+        except Exception:
+            metas = {}
+    return data, metas
+
+
+def save_scenario_cache(scenario, J, data, group_metas):
+    """data(점들) + group_metas(검증키) 를 npz 로 저장."""
+    os.makedirs(COMPARISON_DIR, exist_ok=True)
+    out = {k: v for k, v in data.items() if k != 'meta'}
+    out['meta'] = np.asarray(json.dumps(group_metas))
+    np.savez(scenario_cache_path(scenario, J), **out)
+
+
+def _try_load_row(data, file_metas, paths_idx, row, cur_metas, refresh):
+    """캐시에서 (row, paths_idx) 점 로드 → (ms,yld,t) 또는 None(계산 필요).
+
+    file_metas 비어있으면(옛 번들) 검증 없이 신뢰. 새 포맷이면 그룹 키가 일치해야 로드.
+    옛 번들은 path 구분 없는 concat 키({slug}_ms) → paths_idx==1 로만 재사용.
+    """
+    if refresh:
+        return None
+    slug, group = ROW_SLUG[row], ROW_GROUP[row]
+    if file_metas:                                   # 새 포맷 — 그룹 키 검증
+        stored = file_metas.get(group)
+        if stored is None or cache_meta_mismatch(stored, cur_metas[group]):
+            return None
+    key = f'p{paths_idx}_{slug}_ms'
+    if key in data:
+        t = float(data[f'p{paths_idx}_{slug}_t']) if f'p{paths_idx}_{slug}_t' in data else 0.0
+        return (np.asarray(data[key], np.float32),
+                np.asarray(data[f'p{paths_idx}_{slug}_yld'], np.float32), t)
+    if paths_idx == 1 and not file_metas and f'{slug}_ms' in data:    # 옛 번들 concat → p1
+        return (np.asarray(data[f'{slug}_ms'], np.float32),
+                np.asarray(data[f'{slug}_yld'], np.float32), 0.0)
+    return None
 
 
 # =====================================================
@@ -255,72 +341,43 @@ def nsga_front(env, scorer, proc, wq_1, machines_eff, J, S, anchors,
 def evaluate_one_path(*, scenario, base_policy, device, J, S, base_machines,
                       base_csv, p_csv, anchors, seed, ga_seed, wq_min, wq_max,
                       num_lambdas, samples, nsga_pop, nsga_gen, yield_mode,
-                      pred_base_zip, pred_shift_zip, gt_ckpt, s1_delta=0.1,
-                      q_idx=3, p_idx=3, paths_idx=1, nsga_refresh=False):
-    """scenario 의 한 path → {row: (ms, yld, time_s)} dict."""
-    gq, proc, machines_eff = build_shifted_instance(
-        scenario, base_csv, p_csv, J, base_machines, device, wq_min, wq_max,
-        s1_delta=s1_delta)
+                      pred_base_zip, pred_shift_zip, gt_ckpt, s1_delta, rows_to_compute):
+    """rows_to_compute 에 든 행만 계산해 ({row:(ms,yld,t)}, machines_eff) 반환.
 
+    캐시 로드/저장은 run_scenario 가 시나리오당 1파일로 관리한다. 필요한 행이 쓰는
+    모델만 로드해 불필요한 setup 을 피한다.
+    """
+    gq, proc, machines_eff = build_shifted_instance(
+        scenario, base_csv, p_csv, J, base_machines, device, wq_min, wq_max, s1_delta=s1_delta)
     env = HFSPGraphEnv(num_jobs=J, machine_cnt_list=machines_eff, device=device)
     env_edge_lookup_t = make_env_edge_lookup(env).to(device)
-
     # 모든 방법이 동일 wafer_quality 를 보도록 한 번만 샘플 (shifted GT 에서).
     wq_1 = gq.sample_wafer_quality(B=1, num_jobs=J, seed=seed, device=device)   # (1, J)
 
-    qh_base = make_quality_helper(pred_base_zip, S, device)        # 옛 품질 landscape
-    qh_shift = make_quality_helper(pred_shift_zip, S, device)      # shift 에 맞춘 (기본=base)
-    gt_policy = load_policy(gt_ckpt, env, device)                  # shift 로 학습한 정책
-
     out = {}
-
-    # pred=base : base 정책 + base 예측모델, shifted GT 채점.
-    (ms, yld), t = timed(lambda: model_front(
-        base_policy, env, env_edge_lookup_t, device, qh_base, gq, proc, wq_1,
-        num_lambdas, samples, seed, yield_mode), device)
-    out['pred=base'] = (ms, yld, t)
-
-    # pred=shift : base 정책 + shift 예측모델, shifted GT 채점.
-    (ms, yld), t = timed(lambda: model_front(
-        base_policy, env, env_edge_lookup_t, device, qh_shift, gq, proc, wq_1,
-        num_lambdas, samples, seed, yield_mode), device)
-    out['pred=shift'] = (ms, yld, t)
-
-    # gt=shift : shift 학습 정책 + shifted GT oracle (quality_helper = scorer = gq).
-    (ms, yld), t = timed(lambda: model_front(
-        gt_policy, env, env_edge_lookup_t, device, gq, gq, proc, wq_1,
-        num_lambdas, samples, seed, yield_mode), device)
-    out['gt=shift'] = (ms, yld, t)
-
-    # NSGA (GT) : shifted GT scorer. 느린 단계 → 시나리오별 캐시(키 일치 시 로드).
-    nsga_meta = nsga_cache_meta(
-        scenario=scenario, s1_delta=s1_delta, q_idx=q_idx, p_idx=p_idx, J=J,
-        base_machines=base_machines, machines_eff=machines_eff,
-        nsga_pop=nsga_pop, nsga_gen=nsga_gen, ga_seed=ga_seed, yield_mode=yield_mode,
-        wq_min=wq_min, wq_max=wq_max, seed=seed, anchors=anchors)
-    cpath = nsga_cache_path(scenario, J, machines_eff, nsga_pop, nsga_gen, s1_delta)
-    hit = False
-    if not nsga_refresh:
-        cached, meta = load_baseline_cache(cpath, paths_idx)
-        if cached is not None:
-            mism = cache_meta_mismatch(meta, nsga_meta)
-            if not mism:
-                ms, yld, t = cached
-                out['NSGA (GT)'] = (np.asarray(ms, np.float32),
-                                    np.asarray(yld, np.float32), t)
-                print(f"  [nsga-cache] hit -> {cpath} "
-                      f"(p{paths_idx}, |pts|={np.asarray(ms).size}, orig t={t:.1f}s)")
-                hit = True
-            else:
-                print(f"  [nsga-cache] key mismatch {mism} → 재계산")
-    if not hit:
+    if 'pred=base' in rows_to_compute:               # base 정책 + base 예측모델, shifted GT 채점
+        qh = make_quality_helper(pred_base_zip, S, device)
+        (ms, yld), t = timed(lambda: model_front(
+            base_policy, env, env_edge_lookup_t, device, qh, gq, proc, wq_1,
+            num_lambdas, samples, seed, yield_mode), device)
+        out['pred=base'] = (ms, yld, t)
+    if 'pred=shift' in rows_to_compute:              # base 정책 + shift 예측모델
+        qh = make_quality_helper(pred_shift_zip, S, device)
+        (ms, yld), t = timed(lambda: model_front(
+            base_policy, env, env_edge_lookup_t, device, qh, gq, proc, wq_1,
+            num_lambdas, samples, seed, yield_mode), device)
+        out['pred=shift'] = (ms, yld, t)
+    if 'gt=shift' in rows_to_compute:                # gt 정책 + shifted GT oracle (helper=scorer=gq)
+        gt_policy = load_policy(gt_ckpt, env, device)
+        (ms, yld), t = timed(lambda: model_front(
+            gt_policy, env, env_edge_lookup_t, device, gq, gq, proc, wq_1,
+            num_lambdas, samples, seed, yield_mode), device)
+        out['gt=shift'] = (ms, yld, t)
+    if 'NSGA (GT)' in rows_to_compute:               # shifted GT scorer
         (ms, yld), t = timed(lambda: nsga_front(
             env, gq, proc, wq_1, machines_eff, J, S, anchors,
             nsga_pop, nsga_gen, ga_seed, yield_mode), device)
         out['NSGA (GT)'] = (ms, yld, t)
-        save_baseline_cache(cpath, paths_idx, ms, yld, t, nsga_meta)
-        print(f"  [nsga-cache] saved -> {cpath} (p{paths_idx})")
-
     return out, machines_eff
 
 
@@ -362,40 +419,102 @@ def build_table(agg, header, n_paths):
 ROW_COLORS = {'pred=base': 'tab:blue', 'pred=shift': 'tab:red',
               'gt=shift': 'tab:green', 'NSGA (GT)': 'tab:orange'}
 
+# 플롯에 그릴 행 — gt=shift / NSGA 제외, pred=base vs pred=shift 만 시각화.
+PLOT_ROWS = ['pred=base', 'pred=shift']
+SCENARIO_DESC_EN = {
+    1: 'best-quality machine -> (stage min - {delta})',
+    2: 'last-stage quality rank reversed',
+    3: 'remove last-stage best-quality machine (machines -1)',
+}
 
-def plot_scenario_fronts(pts, save_path, title):
-    """4행의 점집합을 한 그림에 overlay — 옅은 산점도 + Pareto front 선/마커.
+# 그림 크기 — experiment_pareto.py 와 동일 (점 대비 플롯 영역이 너무 커 보이지 않게).
+#   단일: FIGSIZE_SINGLE = (6.2, 4.3),  결합: per-subplot ≈ 4.33×3.8 (pareto grid 13/3, 7.6/2).
+FIGSIZE_SINGLE = (6.2, 4.3)
+FIGSIZE_COMBINED_PER_COL = 4.33                   # subplot 1 개당 폭
+FIGSIZE_COMBINED_HEIGHT = 5.0                     # 1 행 전체 높이 (suptitle + 하단 범례 포함)
 
-    pts[row] = (ms, yld). 축은 데이터에 autoscale 해 방법 간 차이를 최대로 보이게 한다.
+
+def _draw_scenario_fronts(ax, pts, title, with_legend=True,
+                          cloud_frac=0.0, cloud_seed=0):
+    """단일 axes 에 PLOT_ROWS 의 Pareto front (+옵션: dominated 점 n% cloud) 를 그린다.
+
+    cloud_frac (0.0~1.0): dominated(비-front) 점들 중 무작위로 이만큼만 옅은 산점도로 추가.
+    0=완전 클린(Pareto front 만, 기본), 1=원본 전부. front 자체는 *항상 full 데이터* 로 계산해
+    표시되는 cloud 와 무관하게 front 의 정확성이 보존된다.
+    with_legend=False: ax 자체 범례 생략 — 결합 플롯에서 fig.legend 로 하단 공통 범례 사용.
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(8.0, 5.5))
-    for r in ROWS:
+    rng = np.random.default_rng(cloud_seed) if cloud_frac > 0 else None
+    for r in PLOT_ROWS:
         ms = np.asarray(pts[r][0], np.float64).ravel()
         yld = np.asarray(pts[r][1], np.float64).ravel()
         if ms.size == 0:
             continue
         c = ROW_COLORS[r]
-        ax.scatter(ms, yld, s=12, alpha=0.22, color=c)
         front = compute_pareto_front(ms, yld)
+        if cloud_frac > 0:                              # dominated 점만 n% 옅게
+            mask = np.ones(ms.size, dtype=bool)
+            mask[front] = False
+            dom_idx = np.where(mask)[0]
+            if dom_idx.size > 0:
+                k = max(1, int(round(dom_idx.size * min(cloud_frac, 1.0))))
+                pick = (dom_idx if k >= dom_idx.size
+                        else rng.choice(dom_idx, size=k, replace=False))
+                ax.scatter(ms[pick], yld[pick], s=10, alpha=0.22, color=c)
         if front.size >= 2:
             order = np.argsort(ms[front])              # makespan 오름차순 연결
-            ax.plot(ms[front][order], yld[front][order], '-o', ms=4, lw=1.4,
+            ax.plot(ms[front][order], yld[front][order], '-o', ms=5, lw=1.6,
                     color=c, label=r)
         elif front.size == 1:
             ax.scatter(ms[front], yld[front], s=90, marker='*',
                        color=c, edgecolor='black', zorder=5, label=r)
     ax.set_xlabel('Makespan ↓')
     ax.set_ylabel('Yield ↑')
-    ax.set_title(title, fontsize=9)
+    ax.set_title(title, fontweight='bold')
     ax.grid(True, linestyle='--', alpha=0.4)
-    ax.legend(loc='best', fontsize=8)
+    if with_legend:
+        ax.legend(loc='best', fontsize=9)
+
+
+def plot_scenario_fronts(pts, save_path, title, cloud_frac=0.0, cloud_seed=0):
+    """PLOT_ROWS 의 점집합을 한 그림에 overlay — Pareto front (+ 옵션 cloud)."""
+    fig, ax = plt.subplots(figsize=FIGSIZE_SINGLE)
+    _draw_scenario_fronts(ax, pts, title, cloud_frac=cloud_frac, cloud_seed=cloud_seed)
     fig.tight_layout()
     os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
     fig.savefig(save_path, dpi=120, bbox_inches='tight')
+    plt.close(fig)
+
+
+def plot_combined_fronts(items, save_path, suptitle='', cloud_frac=0.0, cloud_seed=0):
+    """items=[(pts, subtitle), ...] → 가로 N 개 서브플롯 + 큰 suptitle + 하단 공통 범례.
+
+    experiment_pareto.py 의 batch grid 스타일을 따라 했다 — 각 subplot 은 bold subtitle 만,
+    범례는 figure 하단(upper center, y=0.13)에 ncol=N 으로 한 번만.
+    """
+    n = len(items)
+    fig, axes = plt.subplots(
+        1, n,
+        figsize=(FIGSIZE_COMBINED_PER_COL * n, FIGSIZE_COMBINED_HEIGHT),
+        squeeze=False)
+    for ax, (pts, subtitle) in zip(axes[0], items):
+        _draw_scenario_fronts(ax, pts, subtitle, with_legend=False,
+                              cloud_frac=cloud_frac, cloud_seed=cloud_seed)
+
+    # 하단 공통 범례 — Pareto front 선/마커를 그대로 미러링.
+    handles = [
+        Line2D([0], [0], linestyle='-', marker='o', markersize=6, lw=1.6,
+               color=ROW_COLORS['pred=base'], label='pred=base'),
+        Line2D([0], [0], linestyle='-', marker='o', markersize=6, lw=1.6,
+               color=ROW_COLORS['pred=shift'], label='pred=shift'),
+    ]
+    fig.tight_layout(rect=[0, 0.13, 1, 0.94])     # 아래 범례 + 위 suptitle 공간
+    fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, 0.13),
+               ncol=len(handles), frameon=True, prop=dict(size=12, weight='bold'),
+               columnspacing=0.8, handletextpad=0.4)
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=16, fontweight='bold', y=0.965)
+    os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+    fig.savefig(save_path, dpi=130, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -409,36 +528,66 @@ def run_scenario(scenario, *, base_policy, device, args, paths_idx_list,
     p_csv = f'quality_data/P_{args.p_idx}.csv'
     desc = (f"최고품질 기계 → (그 stage 최저 - {args.s1_delta})" if scenario == 1
             else SCENARIO_DESC[scenario])
+    machines_eff = effective_machines(scenario, base_machines)
 
     print(f"\n############## Scenario {scenario}: {desc} ##############")
     if os.path.abspath(pred_shift_zip) == os.path.abspath(pred_base_zip):
         print(f"[note] pred=shift 예측모델이 base 와 동일 — adapted 모델 학습 후 "
               f"--pred_s{scenario} 로 교체하세요 (지금은 pred=base 와 같은 결과).")
 
+    # 시나리오당 1파일 캐시 로드 + 현재 설정 키. meta 없으면 옛 번들 → 신뢰 재사용(재계산 0).
+    cur_metas = cache_group_metas(
+        scenario=scenario, s1_delta=args.s1_delta, q_idx=args.q_idx, p_idx=args.p_idx, J=J,
+        base_machines=base_machines, machines_eff=machines_eff,
+        num_lambdas=args.num_lambdas, samples=args.samples, seed=args.seed, ga_seed=args.ga_seed,
+        yield_mode=args.yield_mode, wq_min=wq_min, wq_max=wq_max, anchors=anchors,
+        nsga_pop=args.nsga_pop, nsga_gen=args.nsga_gen, ckpt_base=args.ckpt_base,
+        pred_base_zip=pred_base_zip, pred_shift_zip=pred_shift_zip, gt_ckpt=gt_ckpt)
+    cache_data, file_metas = load_scenario_cache(scenario, J)
+    if cache_data and not file_metas:
+        print("  [cache] 옛 번들(검증키 없음) — 설정 동일 가정하고 그대로 재사용")
+
     agg = {r: {'HV': [], 'IGD+': [], 'Makespan': [], 'Quality': [], 'Time': []}
            for r in ROWS}
     plot_pts = {r: ([], []) for r in ROWS}          # path 별 점 누적 (Pareto 플롯용)
-    machines_eff = None
+    save_data = {}                                  # 새 포맷으로 다시 저장할 점들
     for paths_idx in paths_idx_list:
         base_csv = f'quality_data/Q_{args.q_idx}/historical_paths_{paths_idx}.csv'
         print(f"\n---------- scenario {scenario} | paths_{paths_idx} ----------")
-        out, machines_eff = evaluate_one_path(
-            scenario=scenario, base_policy=base_policy, device=device,
-            J=J, S=S, base_machines=base_machines, base_csv=base_csv, p_csv=p_csv,
-            anchors=anchors, seed=args.seed, ga_seed=args.ga_seed,
-            wq_min=wq_min, wq_max=wq_max,
-            num_lambdas=args.num_lambdas, samples=args.samples,
-            nsga_pop=args.nsga_pop, nsga_gen=args.nsga_gen,
-            yield_mode=args.yield_mode,
-            pred_base_zip=pred_base_zip, pred_shift_zip=pred_shift_zip,
-            gt_ckpt=gt_ckpt, s1_delta=args.s1_delta,
-            q_idx=args.q_idx, p_idx=args.p_idx, paths_idx=paths_idx,
-            nsga_refresh=args.nsga_refresh)
 
-        # 1st pass: 방법별 독립 지표(HV/Makespan/Quality) + 점집합.
+        out, to_compute = {}, []
+        for r in ROWS:
+            refresh = args.nsga_refresh if r == 'NSGA (GT)' else args.model_refresh
+            loaded = _try_load_row(cache_data, file_metas, paths_idx, r, cur_metas, refresh)
+            if loaded is not None:
+                out[r] = loaded
+            else:
+                to_compute.append(r)
+        if to_compute:
+            print(f"  [compute] {to_compute}")
+            computed, machines_eff = evaluate_one_path(
+                scenario=scenario, base_policy=base_policy, device=device,
+                J=J, S=S, base_machines=base_machines, base_csv=base_csv, p_csv=p_csv,
+                anchors=anchors, seed=args.seed, ga_seed=args.ga_seed,
+                wq_min=wq_min, wq_max=wq_max,
+                num_lambdas=args.num_lambdas, samples=args.samples,
+                nsga_pop=args.nsga_pop, nsga_gen=args.nsga_gen, yield_mode=args.yield_mode,
+                pred_base_zip=pred_base_zip, pred_shift_zip=pred_shift_zip,
+                gt_ckpt=gt_ckpt, s1_delta=args.s1_delta, rows_to_compute=to_compute)
+            out.update(computed)
+        else:
+            print(f"  [cache] 4행 모두 히트 (p{paths_idx}) → 계산 생략")
+
+        for r in ROWS:                              # 새 포맷(path별)으로 적재
+            slug = ROW_SLUG[r]
+            ms, yld, t = out[r]
+            save_data[f'p{paths_idx}_{slug}_ms'] = np.asarray(ms, np.float32).ravel()
+            save_data[f'p{paths_idx}_{slug}_yld'] = np.asarray(yld, np.float32).ravel()
+            save_data[f'p{paths_idx}_{slug}_t'] = np.asarray(float(t), np.float32)
+
+        # 1st pass: 방법별 독립 지표 + 점집합 / 2nd pass: 공통 ref front → 행별 IGD+.
         pts = {r: (out[r][0], out[r][1]) for r in ROWS}
         md = {r: compute_metrics(out[r][0], out[r][1], anchors) for r in ROWS}
-        # 2nd pass: 4행 점을 합쳐 best-known front → 행별 IGD+ (공통 기준).
         ref_front = build_reference_front(pts, anchors)
         for r in ROWS:
             ms, yld, t = out[r]
@@ -454,6 +603,12 @@ def run_scenario(scenario, *, base_policy, device, args, paths_idx_list,
             print(f"  {r:11s}  HV={md[r]['HV']:.4f}  IGD+={igd_str}  "
                   f"ms={md[r]['Makespan']:.1f}  q={md[r]['Quality']:.4f}  "
                   f"t={t:.2f}s  |pts|={np.asarray(ms).size}")
+
+    try:                                            # 캐시 저장(옛 번들 → 새 포맷 승격)
+        save_scenario_cache(scenario, J, save_data, cur_metas)
+        print(f"saved -> {scenario_cache_path(scenario, J)}  (점 캐시)")
+    except Exception as e:
+        print(f"[warn] 점 캐시 저장 실패: {e}")
 
     header = (f"Scenario {scenario} ({desc})  |  "
               f"N={J}, M={machines_eff}, (Q{args.q_idx},P{args.p_idx}), "
@@ -471,15 +626,21 @@ def run_scenario(scenario, *, base_policy, device, args, paths_idx_list,
         print(f"[warn] CSV 저장 실패: {e}")
 
     png_path = f'test_results/shift_scenario{scenario}_W{J}_pareto.png'
+    pts_cat = {r: (np.concatenate(plot_pts[r][0]) if plot_pts[r][0] else np.array([]),
+                   np.concatenate(plot_pts[r][1]) if plot_pts[r][1] else np.array([]))
+               for r in ROWS}
+    desc_en = (SCENARIO_DESC_EN[1].format(delta=args.s1_delta) if scenario == 1
+               else SCENARIO_DESC_EN[scenario])
+    plot_title = (f"Scenario {scenario} ({desc_en})  |  "
+                  f"N={J}, M={machines_eff}, (Q{args.q_idx},P{args.p_idx}), "
+                  f"yield={args.yield_mode}")
     try:
-        pts_cat = {r: (np.concatenate(plot_pts[r][0]) if plot_pts[r][0] else np.array([]),
-                       np.concatenate(plot_pts[r][1]) if plot_pts[r][1] else np.array([]))
-                   for r in ROWS}
-        plot_scenario_fronts(pts_cat, png_path, header)
+        plot_scenario_fronts(pts_cat, png_path, plot_title,
+                             cloud_frac=args.cloud_frac, cloud_seed=args.seed)
         print(f"saved -> {png_path}")
     except Exception as e:
         print(f"[warn] Pareto 플롯 저장 실패: {e}")
-    return rows
+    return rows, pts_cat, plot_title
 
 
 # =====================================================
@@ -549,8 +710,10 @@ def main():
                    help="모델 λ 당 sample 수 (>1=stochastic, 1=greedy). 클수록 front 풍부·느림.")
     p.add_argument('--nsga_pop', type=int, default=100)
     p.add_argument('--nsga_gen', type=int, default=200)
+    p.add_argument('--model_refresh', default=False,
+                   help="모델 행(pred=base/shift, gt=shift) 캐시 무시·재계산+덮어쓰기. 켜려면 --model_refresh 1.")
     p.add_argument('--nsga_refresh', default=False,
-                   help="NSGA 캐시를 무시하고 강제 재계산+덮어쓰기. 켜려면 --nsga_refresh 1.")
+                   help="NSGA 캐시 무시·재계산+덮어쓰기. 켜려면 --nsga_refresh 1.")
     p.add_argument('--xlim', type=str, default='100,600',
                    help="makespan anchor 'm_best,m_ref'.")
     p.add_argument('--ylim', type=str, default='0,1',
@@ -558,7 +721,12 @@ def main():
     p.add_argument('--wafer_quality', type=str, default='0.99,1.00')
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--ga_seed', type=int, default=0)
+    p.add_argument('--cloud_frac', type=float, default=0.05,
+                   help="Pareto front 옆에 표시할 dominated 점들의 비율 0~1 "
+                        "(0=front 만 깔끔, 1=원본 전부). 시각 노이즈 vs 분포 단서 트레이드오프.")
     args = p.parse_args()
+    if not (0.0 <= args.cloud_frac <= 1.0):
+        raise ValueError(f"--cloud_frac 은 0~1, got {args.cloud_frac}")
 
     base_machines = [int(x) for x in args.machines.split(',')]
     paths_idx_list = _parse_idx_spec(args.paths_idx)
@@ -595,17 +763,30 @@ def main():
     base_policy = load_policy(args.ckpt_base, tmp_env, device)
 
     all_rows = {}
+    combined_items = []                                 # (pts_cat, short subtitle) 시나리오 순서대로
     for scenario in scenarios:
         gt_ckpt = gt_ckpt_map[scenario] or gt_default
         pred_shift_zip = (pred_zip_map[scenario]
                           or default_shift_pred(args.q_idx, scenario)
                           or args.pred_base)
-        all_rows[scenario] = run_scenario(
+        rows, pts_cat, _ = run_scenario(
             scenario, base_policy=base_policy, device=device, args=args,
             paths_idx_list=paths_idx_list, anchors=anchors,
             base_machines=base_machines, wq_min=wq_min, wq_max=wq_max,
             pred_base_zip=args.pred_base, pred_shift_zip=pred_shift_zip,
             gt_ckpt=gt_ckpt)
+        all_rows[scenario] = rows
+        combined_items.append((pts_cat, f'Scenario {scenario}'))
+
+    if len(combined_items) >= 2:
+        combined_path = f'test_results/shift_combined_W{args.num_jobs}_pareto.png'
+        suptitle = 'Pareto Frontier under Distribution Shift'
+        try:
+            plot_combined_fronts(combined_items, combined_path, suptitle=suptitle,
+                                 cloud_frac=args.cloud_frac, cloud_seed=args.seed)
+            print(f"\nsaved -> {combined_path}  (3 시나리오 결합 플롯)")
+        except Exception as e:
+            print(f"[warn] 결합 Pareto 플롯 저장 실패: {e}")
 
     print("\n=== done ===")
 

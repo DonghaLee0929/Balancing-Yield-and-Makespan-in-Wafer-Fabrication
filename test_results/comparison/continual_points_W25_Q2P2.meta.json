@@ -1,0 +1,101 @@
+{
+  "model": {
+    "J": 25,
+    "base_machines": [
+      5,
+      3,
+      7,
+      3,
+      5,
+      7
+    ],
+    "q_idx": 2,
+    "p_idx": 2,
+    "wq_min": 0.99,
+    "wq_max": 1.0,
+    "yield_mode": "raw",
+    "src_q_idx": 3,
+    "src_paths_idx": 1,
+    "mask_value": -1.0,
+    "num_lambdas": 4,
+    "samples": 4,
+    "seed": 0
+  },
+  "nsga": {
+    "J": 25,
+    "base_machines": [
+      5,
+      3,
+      7,
+      3,
+      5,
+      7
+    ],
+    "q_idx": 2,
+    "p_idx": 2,
+    "wq_min": 0.99,
+    "wq_max": 1.0,
+    "yield_mode": "raw",
+    "nsga_pop": 100,
+    "nsga_gen": 300,
+    "ga_seed": 0,
+    "anchors": [
+      40.0,
+      180.0,
+      1.0,
+      0.0
+    ]
+  },
+  "artifacts": {
+    "zeroshot_e-1": {
+      "path": "checkpoints/0523_baseline.pt",
+      "mtime": 1779763771.6859255,
+      "size": 4156038
+    },
+    "scratchbest_e-1": {
+      "path": "checkpoints/continual/continual_scratch_full_Q1_t3-7\\best_hv.pt",
+      "mtime": 1779906450.0,
+      "size": 4154432
+    },
+    "scratch_e1": {
+      "path": "checkpoints/continual/continual_scratch_full_Q1_t3-7\\epoch_1.pt",
+      "mtime": 1779882632.0,
+      "size": 4154368
+    },
+    "fulladapt_e1": {
+      "path": "checkpoints/continual/continual_adapt_full_Q1_t3-7\\epoch_1.pt",
+      "mtime": 1779915162.0,
+      "size": 4154368
+    },
+    "stalefeat_e1": {
+      "path": "checkpoints/continual/continual_adapt_stale_Q1_t3-7\\epoch_1.pt",
+      "mtime": 1779869390.0,
+      "size": 4154368
+    },
+    "maskedfeat_e1": {
+      "path": "checkpoints/continual/continual_adapt_masked_Q1_t3-7\\epoch_1.pt",
+      "mtime": 1779876322.0,
+      "size": 4154368
+    },
+    "scratch_e2": {
+      "path": "checkpoints/continual/continual_scratch_full_Q1_t3-7\\epoch_2.pt",
+      "mtime": 1779882692.0,
+      "size": 4154368
+    },
+    "fulladapt_e2": {
+      "path": "checkpoints/continual/continual_adapt_full_Q1_t3-7\\epoch_2.pt",
+      "mtime": 1779915222.0,
+      "size": 4154368
+    },
+    "stalefeat_e2": {
+      "path": "checkpoints/continual/continual_adapt_stale_Q1_t3-7\\epoch_2.pt",
+      "mtime": 1779869448.0,
+      "size": 4154368
+    },
+    "maskedfeat_e2": {
+      "path": "checkpoints/continual/continual_adapt_masked_Q1_t3-7\\epoch_2.pt",
+      "mtime": 1779876380.0,
+      "size": 4154368
+    }
+  }
+}
