@@ -17,8 +17,8 @@
     "src_q_idx": 3,
     "src_paths_idx": 1,
     "mask_value": -1.0,
-    "num_lambdas": 4,
-    "samples": 4,
+    "num_lambdas": 32,
+    "samples": 64,
     "seed": 0
   },
   "nsga": {
@@ -63,9 +63,9 @@
       "size": 4154368
     },
     "fulladapt_e1": {
-      "path": "checkpoints/continual/continual_adapt_full_Q1_t3-7\\epoch_1.pt",
-      "mtime": 1779915162.0,
-      "size": 4154368
+      "path": "<train-direct: full-adapt epoch=1>",
+      "mtime": null,
+      "size": null
     },
     "stalefeat_e1": {
       "path": "checkpoints/continual/continual_adapt_stale_Q1_t3-7\\epoch_1.pt",
@@ -83,9 +83,9 @@
       "size": 4154368
     },
     "fulladapt_e2": {
-      "path": "checkpoints/continual/continual_adapt_full_Q1_t3-7\\epoch_2.pt",
-      "mtime": 1779915222.0,
-      "size": 4154368
+      "path": "<train-direct: full-adapt epoch=2>",
+      "mtime": null,
+      "size": null
     },
     "stalefeat_e2": {
       "path": "checkpoints/continual/continual_adapt_stale_Q1_t3-7\\epoch_2.pt",
