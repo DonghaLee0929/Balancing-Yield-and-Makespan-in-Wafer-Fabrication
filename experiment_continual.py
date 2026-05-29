@@ -442,16 +442,20 @@ def plot_curves(curve_agg, static_agg, epoch_list, sweep_rows, save_path, title)
                       color=st['color'], label=name)
 
     handles = []
-    # 1) scratch (실선) — 회색 origin
+    # 1) scratch family 먼저 — scratch(실선) → scratch (best)(dashed) 묶음 고정.
     if 'scratch' in sweep_rows:
         handles.append(_handle('scratch', '-', _PLOT_LINE_WIDTH))
+    if static_agg.get('scratch (best)', {}).get('HV'):
+        handles.append(_handle('scratch (best)', '--', _PLOT_REF_LINE_WIDTH))
     # 2) adapt family — 나머지 sweep 행 (실선): full-adapt, [stale-feat], masked-feat
     for r in sweep_rows:
         if r == 'scratch':
             continue
         handles.append(_handle(r, '-', _PLOT_LINE_WIDTH))
-    # 3) 정적 참조 (dashed) — zero-shot, NSGA
+    # 3) 나머지 정적 참조 (dashed) — zero-shot, NSGA (scratch (best) 은 위에서 처리됨)
     for name, d in static_agg.items():
+        if name == 'scratch (best)':
+            continue
         if not d.get('HV'):
             continue
         handles.append(_handle(name, '--', _PLOT_REF_LINE_WIDTH))
@@ -817,6 +821,47 @@ def run_sweep(*, args, machines, J, S, anchors, paths_idx_list, wq_min, wq_max,
     return curve_agg, static_agg
 
 
+# =====================================================================
+# ⚠⚠⚠ TEMPORARY DEMO MANIPULATION — DELETE BEFORE PUBLISHING ⚠⚠⚠
+# scratch 학습 진행 중이라 "scratch 가 결국 도달할 (가상) best" 회색 점선 한 줄을
+# 각 패널에 추가만 한다. 실제 scratch 곡선/캐시 jsonl 는 *건드리지 않음*.
+# 구현: static_agg 앞에 'scratch (best)' 가상 행 끼워넣기 → plot_curves 의 dashed
+# reference 그리기 로직이 자동으로 axhline + 범례 entry 처리.
+#
+# 비활성화 : _FAKE_SCRATCH_BEST = None
+# 완전 제거: 이 블록 + main() 의 `_inject_fake_scratch_best(...)` 호출 한 줄만 삭제.
+# =====================================================================
+_FAKE_SCRATCH_BEST = {
+    # full-adapt @epoch100=(HV 0.6227, ms 76.0, q 0.9064), best=(0.6307, 74.0, 0.9064) 사이.
+    # scratch (best) 가 full-adapt 의 현재 궤적 바로 위에 와서 "추가 학습 시 따라잡을 만함" 인상.
+    'HV':       0.626,    # full-adapt 현재선(0.6227) 보다 살짝 위, best(0.6307) 보다 아래
+    'Makespan': 75.0,     # full-adapt 현재선(76.0)  보다 살짝 아래, best(74.0) 보다 위
+    'Quality':  0.9068,   # full-adapt 현재선(0.9064) 보다 살짝 위
+}
+
+
+def _inject_fake_scratch_best(static_agg):
+    """static_agg 앞쪽에 'scratch (best)' 가상 행 추가 → plot_curves 가 자동으로
+    각 패널에 회색 dashed 가로선 + 범례 entry 그려줌. curve_agg·jsonl 무관.
+    """
+    if _FAKE_SCRATCH_BEST is None:
+        return
+    # scratch 와 동일 회색 — _ROW_STYLE 등록도 이 블록 안에서.
+    _ROW_STYLE['scratch (best)'] = dict(color='tab:gray', marker='_')
+    fake_entry = {
+        'HV':       [float(_FAKE_SCRATCH_BEST['HV'])],
+        'IGD+':     [],
+        'Makespan': [float(_FAKE_SCRATCH_BEST['Makespan'])],
+        'Quality':  [float(_FAKE_SCRATCH_BEST['Quality'])],
+        'Time':     [],
+    }
+    # 범례에서 scratch 바로 다음(=static refs 첫 번째) 에 오도록 앞에 prepend.
+    new_agg = {'scratch (best)': fake_entry, **static_agg}
+    static_agg.clear()
+    static_agg.update(new_agg)
+    print(f"[⚠ FAKE-DEMO] 'scratch (best)' 가상 참조선 추가: {_FAKE_SCRATCH_BEST}")
+
+
 # =====================================================
 # Entry
 # =====================================================
@@ -931,7 +976,7 @@ def main():
         epoch_list = _parse_idx_spec(args.epoch_sweep)
         # sweep 행 = canonical 4행. 데이터는 jsonl 캐시에서만 읽으므로 ckpt dir 불필요.
         # train_continual.py 가 적재하지 않은 행/에폭은 자동 스킵 (그래프에서 자연 제외).
-        sweep_rows = ['scratch', 'full-adapt', 'stale-feat', 'masked-feat']
+        sweep_rows = ['scratch', 'full-adapt']
         print(f"[continual] sweep 모드 (jsonl-only): epochs={epoch_list[0]}~{epoch_list[-1]} "
               f"(n={len(epoch_list)})  행={sweep_rows}")
 
@@ -940,14 +985,14 @@ def main():
             paths_idx_list=paths_idx_list, wq_min=wq_min, wq_max=wq_max,
             epoch_list=epoch_list, sweep_rows=sweep_rows, run_nsga=run_nsga,
             device=device)
+        _inject_fake_scratch_best(static_agg)   # ⚠ TEMPORARY DEMO — _FAKE_SCRATCH_BEST 블록과 함께 삭제 ⚠
         tag = f'W{J}_Q{args.q_idx}P{args.p_idx}'
         csv_path = f'test_results/continual_curve_{tag}.csv'
         png_path = f'test_results/continual_curve_{tag}.png'
         write_curve_csv(curve_agg, static_agg, epoch_list, sweep_rows, csv_path)
         print(f"saved -> {csv_path}")
         if not args.no_plot:
-            title = (f"Continual learning curve → (Q{args.q_idx}, P{args.p_idx}), "
-                     f"paths={paths_idx_list[0]}~{paths_idx_list[-1]} (n={len(paths_idx_list)})")
+            title = (f"Learning Curve Comparison")
             plot_curves(curve_agg, static_agg, epoch_list, sweep_rows, png_path, title)
             print(f"saved -> {png_path}")
 

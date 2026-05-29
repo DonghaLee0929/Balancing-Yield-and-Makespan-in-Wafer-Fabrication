@@ -500,8 +500,8 @@ def _parse_idx_spec(s: str) -> list[int]:
 def main():
     p = argparse.ArgumentParser(description="HFSP 방법 비교 표.")
     p.add_argument('--ckpt', type=str, default='checkpoints/0528_baseline.pt')
-    p.add_argument('--num_jobs', type=int, default=100)
-    p.add_argument('--machines', type=str, default='20,12,28,12,20,28',
+    p.add_argument('--num_jobs', type=int, default=25)
+    p.add_argument('--machines', type=str, default='5,3,7,3,5,7',
                    help="stage별 머신 수. stage 수는 CSV의 6 고정. base(5,3,7,3,5,7) 초과 시 "
                         "(m%%base) 복제 증강(2배=동일 인자 2벌), 미만 시 앞쪽 subset. 예: '10,6,14,6,10,14'.")
     p.add_argument('--p_idx', type=int, default=3, choices=[1, 2, 3])
@@ -511,7 +511,7 @@ def main():
     p.add_argument('--num_lambdas', type=int, default=32, help="Ours 의 λ grid 크기.")
     p.add_argument('--samples', type=int, default=8, help="Ours (s) 의 λ 당 sample 수.")
     p.add_argument('--nsga_pop', type=int, default=100)
-    p.add_argument('--nsga_gen', type=int, default=100)
+    p.add_argument('--nsga_gen', type=int, default=300)
     p.add_argument('--iabc_pop', type=int, default=0,
                    help="IABC food source 수 SN. 0 이면 nsga_pop 와 동일.")
     p.add_argument('--iabc_gen', type=int, default=0,
@@ -533,7 +533,7 @@ def main():
     p.add_argument('--out', type=str, default='test_results/comparison_table')
     p.add_argument('--no_plot', default=False,
                    help="True 면 overlay 플롯 저장 안 함.")
-    p.add_argument('--only_model', default=False,
+    p.add_argument('--only_model', default=True,
                    help="True 면 모델(Ours g/s)만 실행하고 EST/Quality greedy/NSGA2/IABC 는 "
                         "test_results/comparison/ 캐시에서 로드해 비교군으로 표시(없으면 Ours 만). "
                         "baseline 을 다시 돌리지 않아 빠르고, 같은 캐시 키(J/M/q/p/seed/ga_seed/"

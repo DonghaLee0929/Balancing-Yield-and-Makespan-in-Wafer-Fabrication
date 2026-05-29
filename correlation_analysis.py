@@ -86,7 +86,7 @@ def plot_heatmap(fig, ax, mat, row_labels, col_labels, title):
 def main():
     p = argparse.ArgumentParser(description="λ-sweep 상관관계 히트맵 (2-objective)")
     # test.py CLI 기본값과 1:1 동일 → 인자 없이 돌리면 test.py 와 같은 인스턴스.
-    p.add_argument('--ckpt',        type=str, default='checkpoints/saved_J25_baseline_0519.pt')
+    p.add_argument('--ckpt',        type=str, default='checkpoints/0528_baseline.pt')
     p.add_argument('--num_jobs',    type=int, default=25)
     p.add_argument('--machines',    type=str, default='5,3,7,3,5,7')
     p.add_argument('--p_idx',       type=int, choices=[1, 2, 3], default=3)

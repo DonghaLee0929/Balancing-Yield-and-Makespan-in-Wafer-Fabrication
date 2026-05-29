@@ -1,0 +1,46 @@
+{
+  "model": {
+    "J": 25,
+    "base_machines": [
+      5,
+      3,
+      7,
+      3,
+      5,
+      7
+    ],
+    "q_idx": 2,
+    "p_idx": 2,
+    "wq_min": 0.99,
+    "wq_max": 1.0,
+    "yield_mode": "raw",
+    "num_lambdas": 32,
+    "samples": 64,
+    "seed": 0
+  },
+  "nsga": {
+    "J": 25,
+    "base_machines": [
+      5,
+      3,
+      7,
+      3,
+      5,
+      7
+    ],
+    "q_idx": 2,
+    "p_idx": 2,
+    "wq_min": 0.99,
+    "wq_max": 1.0,
+    "yield_mode": "raw",
+    "nsga_pop": 100,
+    "nsga_gen": 300,
+    "ga_seed": 0,
+    "anchors": [
+      40.0,
+      180.0,
+      1.0,
+      0.0
+    ]
+  }
+}
