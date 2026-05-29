@@ -375,8 +375,9 @@ _PLOT_LINE_WIDTH = 2.0
 _PLOT_REF_LINE_WIDTH = 1.4
 _PLOT_BAND_ALPHA = 0.18
 _PLOT_LEGEND_FONTSIZE = 12      # 하단 공통 범례 — pareto 와 동일
-_PLOT_SUPTITLE_FONTSIZE = 16    # 상단 큰 제목 — pareto 와 동일
-_PLOT_FIGSIZE = (15.0, 5.2)     # suptitle + 하단 legend 공간 확보 위해 살짝 키움
+_PLOT_SUPTITLE_FONTSIZE = 20    # 상단 큰 제목 — pareto 와 동일
+_PLOT_AXLABEL_FONTSIZE = 14   # 축 라벨(HV/Makespan/Quality·Epoch)
+_PLOT_FIGSIZE = (13.0, 4.0)     # 가로 유지, 세로 더 낮춤 (납작한 비율)
 
 
 def plot_curves(curve_agg, static_agg, epoch_list, sweep_rows, save_path, title):
@@ -387,12 +388,17 @@ def plot_curves(curve_agg, static_agg, epoch_list, sweep_rows, save_path, title)
     범례: 패널 별 ax.legend 대신 **fig.legend 하단 공통 1개** (experiment_pareto.py 와 동일 패턴).
     """
     epochs = np.array(epoch_list, dtype=np.float64)
-    metrics = [('HV', 'HV ↑'), ('Makespan', 'Makespan ↓'), ('Quality', 'Quality ↑')]
+    # HV 가 메인 지표 → 왼쪽에 크게(2행 span), 나머지 둘은 오른쪽 위/아래.
+    metrics = [('HV', 'HV ↑'), ('Makespan', 'Makespan ↓'), ('Quality', 'Yield ↑')]
     # zero-shot 평가 = 0523_baseline 그대로 → adapt 행들의 *t=0 정책 상태*. 곡선의 epoch=0
     # 점으로 prepend 해 모두 같은 출발점에서 갈라지는 모양을 만든다 (시각·의미 정합).
     zs_agg = static_agg.get('zero-shot', {})
     has_zs = bool(zs_agg.get('HV'))
-    fig, axes = plt.subplots(1, 3, figsize=_PLOT_FIGSIZE)
+    fig = plt.figure(figsize=_PLOT_FIGSIZE)
+    gs = fig.add_gridspec(2, 2, width_ratios=[1.5, 1.0], hspace=0.35, wspace=0.15)
+    axes = [fig.add_subplot(gs[:, 0]),   # HV — 메인, 왼쪽 큰 패널
+            fig.add_subplot(gs[0, 1]),   # Makespan — 우상단
+            fig.add_subplot(gs[1, 1])]   # Yield — 우하단
     for ax, (key, label) in zip(axes, metrics):
         zs_v = (float(np.nanmean(zs_agg[key]))
                 if has_zs and zs_agg.get(key) else None)
@@ -423,6 +429,8 @@ def plot_curves(curve_agg, static_agg, epoch_list, sweep_rows, save_path, title)
                                 color=st['color'], alpha=_PLOT_BAND_ALPHA,
                                 linewidth=0)
         for name, d in static_agg.items():
+            if name == 'zero-shot':          # 수평선(평균선처럼 보임) 대신 epoch=0 시작점 마커로.
+                continue
             vals = d[key]
             if not vals:
                 continue
@@ -430,16 +438,26 @@ def plot_curves(curve_agg, static_agg, epoch_list, sweep_rows, save_path, title)
             st = _ROW_STYLE.get(name, dict(color='black', marker='o'))
             ax.axhline(v, linestyle='--', color=st['color'],
                        lw=_PLOT_REF_LINE_WIDTH, alpha=0.85)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel(label)
+        # zero-shot = adapt 행들의 t=0 정책 상태(= full-adapt 곡선의 출발점). 전 구간 수평선
+        # 으로 그리면 '평균선'처럼 오해돼, epoch=0 시작점에 점 하나만 찍는다. 튀지 않게
+        # full-adapt 곡선과 같은 색의 작은 원으로 (출발점이 곡선 위에 자연스레 얹히도록).
+        if zs_v is not None:
+            fa_color = _ROW_STYLE.get('full-adapt', dict(color='crimson'))['color']
+            ax.scatter([0.0], [zs_v], s=45, marker='o', color=fa_color, zorder=6)
+        ax.set_xlabel('Epoch', fontsize=_PLOT_AXLABEL_FONTSIZE)
+        ax.set_ylabel(label, fontsize=_PLOT_AXLABEL_FONTSIZE)
         ax.grid(True, linestyle='--', alpha=0.4)
 
     # 하단 공통 범례 proxy handles. 순서: scratch family(처음부터-학습 origin) 먼저,
     # 그다음 adapt family(0523_baseline 에서 갈라진 행들) + zero-shot/NSGA 참조선.
+    # 범례 표시용 라벨 매핑 (데이터 키/스타일 키는 그대로, 표기만 변경).
+    _LEGEND_LABEL = {'scratch': 'Retraining', 'scratch (best)': 'Retraining (best)',
+                     'full-adapt': 'Continual'}
+
     def _handle(name, ls, lw):
         st = _ROW_STYLE.get(name, dict(color='black', marker='o'))
         return Line2D([0], [0], linestyle=ls, linewidth=lw,
-                      color=st['color'], label=name)
+                      color=st['color'], label=_LEGEND_LABEL.get(name, name))
 
     handles = []
     # 1) scratch family 먼저 — scratch(실선) → scratch (best)(dashed) 묶음 고정.
@@ -452,20 +470,21 @@ def plot_curves(curve_agg, static_agg, epoch_list, sweep_rows, save_path, title)
         if r == 'scratch':
             continue
         handles.append(_handle(r, '-', _PLOT_LINE_WIDTH))
-    # 3) 나머지 정적 참조 (dashed) — zero-shot, NSGA (scratch (best) 은 위에서 처리됨)
+    # 3) 나머지 정적 참조 (dashed) — NSGA 등. zero-shot 은 epoch=0 점이라 범례에서 제외.
+    #    (scratch (best) 은 위에서 처리됨)
     for name, d in static_agg.items():
-        if name == 'scratch (best)':
+        if name in ('scratch (best)', 'zero-shot'):
             continue
         if not d.get('HV'):
             continue
         handles.append(_handle(name, '--', _PLOT_REF_LINE_WIDTH))
 
-    fig.tight_layout(rect=[0, 0.13, 1, 0.94])           # 아래 범례 + 위 suptitle 공간
-    fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, 0.13),
+    fig.tight_layout(rect=[0, 0.13, 1, 0.91])           # 아래 범례 + 위 suptitle 공간(제목과 약간 간격)
+    fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, -0.01),
                ncol=len(handles), frameon=True,
                prop=dict(size=_PLOT_LEGEND_FONTSIZE, weight='bold'),
-               columnspacing=0.8, handletextpad=0.4)
-    fig.suptitle(title, fontsize=_PLOT_SUPTITLE_FONTSIZE, fontweight='bold', y=0.965)
+               columnspacing=0.8, handletextpad=0.4, handlelength=1.0)
+    fig.suptitle(title, fontsize=_PLOT_SUPTITLE_FONTSIZE, fontweight='bold', y=0.985)
     os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
     fig.savefig(save_path, dpi=130, bbox_inches='tight')
     plt.close(fig)
@@ -822,44 +841,81 @@ def run_sweep(*, args, machines, J, S, anchors, paths_idx_list, wq_min, wq_max,
 
 
 # =====================================================================
-# ⚠⚠⚠ TEMPORARY DEMO MANIPULATION — DELETE BEFORE PUBLISHING ⚠⚠⚠
-# scratch 학습 진행 중이라 "scratch 가 결국 도달할 (가상) best" 회색 점선 한 줄을
-# 각 패널에 추가만 한다. 실제 scratch 곡선/캐시 jsonl 는 *건드리지 않음*.
-# 구현: static_agg 앞에 'scratch (best)' 가상 행 끼워넣기 → plot_curves 의 dashed
-# reference 그리기 로직이 자동으로 axhline + 범례 entry 처리.
-#
-# 비활성화 : _FAKE_SCRATCH_BEST = None
-# 완전 제거: 이 블록 + main() 의 `_inject_fake_scratch_best(...)` 호출 한 줄만 삭제.
+# scratch (best) 참조선 — scratch jsonl *파일 전체 epoch* 에서 metric별 best 값을 뽑아
+# 각 패널에 회색 dashed 가로선으로 그린다. (HV/Quality 는 max, Makespan 은 min 이 best.)
+# ⚠ 표시 구간(epoch_list, 예: 1~100)이 아니라 파일에 들어있는 모든 epoch(예: 400)를 본다.
+# 실제 scratch 곡선/캐시 jsonl 는 *건드리지 않고* 읽기만 한다.
+# 구현: static_agg 앞에 'scratch (best)' 행 끼워넣기 → plot_curves 의 dashed reference
+# 그리기 로직이 자동으로 axhline + 범례 entry 처리.
 # =====================================================================
-_FAKE_SCRATCH_BEST = {
-    # full-adapt @epoch100=(HV 0.6227, ms 76.0, q 0.9064), best=(0.6307, 74.0, 0.9064) 사이.
-    # scratch (best) 가 full-adapt 의 현재 궤적 바로 위에 와서 "추가 학습 시 따라잡을 만함" 인상.
-    'HV':       0.626,    # full-adapt 현재선(0.6227) 보다 살짝 위, best(0.6307) 보다 아래
-    'Makespan': 75.0,     # full-adapt 현재선(76.0)  보다 살짝 아래, best(74.0) 보다 위
-    'Quality':  0.9068,   # full-adapt 현재선(0.9064) 보다 살짝 위
-}
+_BEST_DIR = {'HV': 'max', 'Makespan': 'min', 'Quality': 'max'}   # metric별 best 방향
 
 
-def _inject_fake_scratch_best(static_agg):
-    """static_agg 앞쪽에 'scratch (best)' 가상 행 추가 → plot_curves 가 자동으로
-    각 패널에 회색 dashed 가로선 + 범례 entry 그려줌. curve_agg·jsonl 무관.
+def _scratch_file_best(J, q_idx, p_idx, paths_idx_list, anchors):
+    """scratch jsonl 파일에 들어있는 *모든 epoch* 에서 metric별 best (path 평균 기준).
+    표시 구간 epoch_list 에 한정하지 않는다. 반환: {metric: best_val} 또는 None.
     """
-    if _FAKE_SCRATCH_BEST is None:
+    path = _sweep_jsonl_path(_SWEEP_SLUG['scratch'], J, q_idx, p_idx)
+    if not os.path.exists(path):
+        return None
+    paths_set = set(int(p) for p in paths_idx_list)
+    pts = {}                                  # (path, epoch) -> (ms, yld), 마지막 라인 우승.
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                if int(rec['path']) not in paths_set:
+                    continue
+                pts[(int(rec['path']), int(rec['epoch']))] = (
+                    np.asarray(rec['ms'], np.float32),
+                    np.asarray(rec['yld'], np.float32))
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+                continue
+    if not pts:
+        return None
+    per_e = {}                                # epoch -> {metric: [per-path vals]}
+    for (_p, e), (ms, yld) in pts.items():
+        md = compute_metrics(ms, yld, anchors)
+        d = per_e.setdefault(e, {'HV': [], 'Makespan': [], 'Quality': []})
+        for k in ('HV', 'Makespan', 'Quality'):
+            d[k].append(md[k])
+    # best 는 *플롯에 그려지는 스무딩 곡선* 기준 (raw 최고 epoch 스파이크 방지).
+    # epoch 오름차순으로 path-평균 시리즈를 만든 뒤 plot_curves 와 동일한 7-window
+    # 이동평균(_smooth)을 적용하고, 그 매끄러운 곡선의 max/min 을 best 로 잡는다.
+    epochs_sorted = sorted(per_e.keys())
+    best = {}
+    for key, direction in _BEST_DIR.items():
+        raw = np.array([float(np.nanmean(per_e[e][key])) if per_e[e][key] else np.nan
+                        for e in epochs_sorted], dtype=np.float64)
+        if not np.any(np.isfinite(raw)):
+            continue
+        sm = _smooth(raw, _PLOT_SMOOTH_WINDOW)
+        best[key] = float(np.nanmax(sm)) if direction == 'max' else float(np.nanmin(sm))
+    return best if 'HV' in best else None
+
+
+def _inject_scratch_best(static_agg, best):
+    """scratch 파일 전체 best(_scratch_file_best 반환값)를 'scratch (best)' 정적 참조행
+    으로 static_agg 앞에 추가. plot_curves 가 각 패널에 회색 dashed 가로선 + 범례 entry
+    를 자동으로 그려준다.
+    """
+    if not best:                              # scratch 점이 하나도 없으면 참조선 생략.
         return
-    # scratch 와 동일 회색 — _ROW_STYLE 등록도 이 블록 안에서.
+    entry = {'HV': [], 'IGD+': [], 'Makespan': [], 'Quality': [], 'Time': []}
+    for key in _BEST_DIR:
+        if key in best:
+            entry[key] = [float(best[key])]
+    # scratch 와 동일 회색.
     _ROW_STYLE['scratch (best)'] = dict(color='tab:gray', marker='_')
-    fake_entry = {
-        'HV':       [float(_FAKE_SCRATCH_BEST['HV'])],
-        'IGD+':     [],
-        'Makespan': [float(_FAKE_SCRATCH_BEST['Makespan'])],
-        'Quality':  [float(_FAKE_SCRATCH_BEST['Quality'])],
-        'Time':     [],
-    }
     # 범례에서 scratch 바로 다음(=static refs 첫 번째) 에 오도록 앞에 prepend.
-    new_agg = {'scratch (best)': fake_entry, **static_agg}
+    new_agg = {'scratch (best)': entry, **static_agg}
     static_agg.clear()
     static_agg.update(new_agg)
-    print(f"[⚠ FAKE-DEMO] 'scratch (best)' 가상 참조선 추가: {_FAKE_SCRATCH_BEST}")
+    print(f"[continual] 'scratch (best)' 참조선(파일 전체 best): "
+          f"HV={entry['HV']}, ms={entry['Makespan']}, q={entry['Quality']}")
 
 
 # =====================================================
@@ -914,7 +970,7 @@ def main():
                    help="zero-shot: (P3,Q3) 사전학습 정책 (추가 학습 없이 평가; 학습곡선 t=0). "
                         "기본 0523_baseline.pt — 모든 continual ckpt 의 init 베이스. 빈값 → 제외.")
     # ── 학습 곡선(sweep) 모드 ──
-    p.add_argument('--epoch_sweep', type=str, default='1~100',
+    p.add_argument('--epoch_sweep', type=str, default='1~400',
                    help="비우면 단일 스냅샷 표 모드. 지정 시 학습 곡선 모드 (jsonl-only): "
                         "'1~100:5' (stride) 또는 '1,5,10,20'. 점은 train_continual.py 가 매 "
                         "epoch 적재한 continual_points_W{J}_Q{q}P{p}.jsonl 에서만 읽음.")
@@ -985,7 +1041,9 @@ def main():
             paths_idx_list=paths_idx_list, wq_min=wq_min, wq_max=wq_max,
             epoch_list=epoch_list, sweep_rows=sweep_rows, run_nsga=run_nsga,
             device=device)
-        _inject_fake_scratch_best(static_agg)   # ⚠ TEMPORARY DEMO — _FAKE_SCRATCH_BEST 블록과 함께 삭제 ⚠
+        # scratch (best) = scratch jsonl 파일 전체 epoch 중 best (표시 구간 epoch_list 무관).
+        scratch_best = _scratch_file_best(J, args.q_idx, args.p_idx, paths_idx_list, anchors)
+        _inject_scratch_best(static_agg, scratch_best)
         tag = f'W{J}_Q{args.q_idx}P{args.p_idx}'
         csv_path = f'test_results/continual_curve_{tag}.csv'
         png_path = f'test_results/continual_curve_{tag}.png'

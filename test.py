@@ -519,7 +519,7 @@ def evaluate_pareto(
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument('--ckpt',        type=str, default='checkpoints/saved_J25_new_baseline.pt')
+    p.add_argument('--ckpt',        type=str, default='checkpoints/0528_baseline.pt')
     p.add_argument('--method',      type=str, default='model',
                    choices=['model', 'est'],
                    help="스케줄링 정책. 'model' = 학습된 λ-conditioned 모델, "
@@ -527,16 +527,16 @@ if __name__ == "__main__":
                         "yield 계산(raw/percentile)은 두 경우 동일.")
     p.add_argument('--num_jobs',    type=int, default=25)
     p.add_argument('--machines',    type=str, default='5,3,7,3,5,7')
-    p.add_argument('--yield_mode',  type=str, default='percentile',
+    p.add_argument('--yield_mode',  type=str, default='raw',
                    choices=['raw', 'percentile'],
                    help="둘 다 ground-truth (CSV quality factor 기반, 예측 모델 미사용). "
                         "'raw' = quality factor 의 path 곱 × 초기 품질 (job 평균), "
                         "'percentile' = 그 path 곱의 전체 분포 대비 백분위 (job 평균)")
     p.add_argument('--num_lambdas',        type=int, default=32,
                    help='λ grid 크기. linspace(0,1,N) 으로 sweep.')
-    p.add_argument('--samples', type=int, default=8,
+    p.add_argument('--samples', type=int, default=64,
                    help='λ 당 trajectory 수. 1 = greedy, >1 = stochastic sampling.')
-    p.add_argument('--paths_idx',   type=str, default='1~10',
+    p.add_argument('--paths_idx',   type=str, default='1',
                    help="historical_paths 인덱스. 단일('5') / range('1~10') / list('1,3,5'). "
                         "여러 개면 각 idx 별 1회 실험 후 (makespan, yield) 평균으로 Pareto 그림. "
                         "모델/풀 : quality_results/Q_{q_idx}/paths_{paths_idx}/{best_hb_model.zip, wafer_quality.json}. "

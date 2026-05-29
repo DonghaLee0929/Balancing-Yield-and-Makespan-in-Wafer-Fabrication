@@ -509,7 +509,7 @@ def main():
     p.add_argument('--paths_idx', type=str, default='1',
                    help="historical_paths 인덱스. '1' / '1~10' / '1,3,5'. 여러 개면 path 평균.")
     p.add_argument('--num_lambdas', type=int, default=32, help="Ours 의 λ grid 크기.")
-    p.add_argument('--samples', type=int, default=8, help="Ours (s) 의 λ 당 sample 수.")
+    p.add_argument('--samples', type=int, default=64, help="Ours (s) 의 λ 당 sample 수.")
     p.add_argument('--nsga_pop', type=int, default=100)
     p.add_argument('--nsga_gen', type=int, default=300)
     p.add_argument('--iabc_pop', type=int, default=0,

@@ -416,11 +416,13 @@ def build_table(agg, header, n_paths):
 
 
 # 4행 색맵 (Pareto 플롯). pred=base 파랑 / pred=shift 빨강 / gt=shift 초록 / NSGA 주황.
-ROW_COLORS = {'pred=base': 'tab:blue', 'pred=shift': 'tab:red',
+ROW_COLORS = {'pred=base': 'tab:gray', 'pred=shift': 'tab:red',
               'gt=shift': 'tab:green', 'NSGA (GT)': 'tab:orange'}
 
 # 플롯에 그릴 행 — gt=shift / NSGA 제외, pred=base vs pred=shift 만 시각화.
 PLOT_ROWS = ['pred=base', 'pred=shift']
+# 플롯 범례 표기 (데이터 키 ROWS 는 그대로, 표시 라벨만). continual 의 _LEGEND_LABEL 패턴.
+PLOT_LABEL = {'pred=base': 'Pred=base', 'pred=shift': 'Pred=shift'}
 SCENARIO_DESC_EN = {
     1: 'best-quality machine -> (stage min - {delta})',
     2: 'last-stage quality rank reversed',
@@ -432,6 +434,12 @@ SCENARIO_DESC_EN = {
 FIGSIZE_SINGLE = (6.2, 4.3)
 FIGSIZE_COMBINED_PER_COL = 4.33                   # subplot 1 개당 폭
 FIGSIZE_COMBINED_HEIGHT = 5.0                     # 1 행 전체 높이 (suptitle + 하단 범례 포함)
+
+# 폰트 크기 — experiment_continual.py 와 동일 컨벤션 (축 라벨 14 / suptitle 20 / 범례 12).
+_PLOT_AXLABEL_FONTSIZE = 14    # 축 라벨 (Makespan ↓ / Yield ↑)
+_PLOT_TITLE_FONTSIZE = 15      # 각 subplot 제목 (시나리오 이름)
+_PLOT_SUPTITLE_FONTSIZE = 20   # 상단 큰 제목 — continual 과 동일
+_PLOT_LEGEND_FONTSIZE = 12     # 하단 공통 범례 — continual 과 동일
 
 
 def _draw_scenario_fronts(ax, pts, title, with_legend=True,
@@ -460,19 +468,20 @@ def _draw_scenario_fronts(ax, pts, title, with_legend=True,
                 pick = (dom_idx if k >= dom_idx.size
                         else rng.choice(dom_idx, size=k, replace=False))
                 ax.scatter(ms[pick], yld[pick], s=10, alpha=0.22, color=c)
+        lbl = PLOT_LABEL.get(r, r)
         if front.size >= 2:
             order = np.argsort(ms[front])              # makespan 오름차순 연결
             ax.plot(ms[front][order], yld[front][order], '-o', ms=5, lw=1.6,
-                    color=c, label=r)
+                    color=c, label=lbl)
         elif front.size == 1:
             ax.scatter(ms[front], yld[front], s=90, marker='*',
-                       color=c, edgecolor='black', zorder=5, label=r)
-    ax.set_xlabel('Makespan ↓')
-    ax.set_ylabel('Yield ↑')
-    ax.set_title(title, fontweight='bold')
+                       color=c, edgecolor='black', zorder=5, label=lbl)
+    ax.set_xlabel('Makespan ↓', fontsize=_PLOT_AXLABEL_FONTSIZE)
+    ax.set_ylabel('Yield ↑', fontsize=_PLOT_AXLABEL_FONTSIZE)
+    ax.set_title(title, fontsize=_PLOT_TITLE_FONTSIZE, fontweight='bold')
     ax.grid(True, linestyle='--', alpha=0.4)
     if with_legend:
-        ax.legend(loc='best', fontsize=9)
+        ax.legend(loc='best', fontsize=_PLOT_LEGEND_FONTSIZE)
 
 
 def plot_scenario_fronts(pts, save_path, title, cloud_frac=0.0, cloud_seed=0):
@@ -503,16 +512,18 @@ def plot_combined_fronts(items, save_path, suptitle='', cloud_frac=0.0, cloud_se
     # 하단 공통 범례 — Pareto front 선/마커를 그대로 미러링.
     handles = [
         Line2D([0], [0], linestyle='-', marker='o', markersize=6, lw=1.6,
-               color=ROW_COLORS['pred=base'], label='pred=base'),
+               color=ROW_COLORS['pred=base'], label=PLOT_LABEL['pred=base']),
         Line2D([0], [0], linestyle='-', marker='o', markersize=6, lw=1.6,
-               color=ROW_COLORS['pred=shift'], label='pred=shift'),
+               color=ROW_COLORS['pred=shift'], label=PLOT_LABEL['pred=shift']),
     ]
     fig.tight_layout(rect=[0, 0.13, 1, 0.94])     # 아래 범례 + 위 suptitle 공간
-    fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, 0.13),
-               ncol=len(handles), frameon=True, prop=dict(size=12, weight='bold'),
+    fig.legend(handles=handles, loc='upper center', bbox_to_anchor=(0.5, 0.15),
+               ncol=len(handles), frameon=True,
+               prop=dict(size=_PLOT_LEGEND_FONTSIZE, weight='bold'),
                columnspacing=0.8, handletextpad=0.4)
     if suptitle:
-        fig.suptitle(suptitle, fontsize=16, fontweight='bold', y=0.965)
+        fig.suptitle(suptitle, fontsize=_PLOT_SUPTITLE_FONTSIZE,
+                     fontweight='bold', y=0.99)
     os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
     fig.savefig(save_path, dpi=130, bbox_inches='tight')
     plt.close(fig)
@@ -616,16 +627,8 @@ def run_scenario(scenario, *, base_policy, device, args, paths_idx_list,
     table_str, rows = build_table(agg, header, len(paths_idx_list))
     print(table_str)
 
-    csv_path = f'test_results/shift_scenario{scenario}_W{J}_table.csv'
-    try:
-        import pandas as pd
-        os.makedirs(os.path.dirname(csv_path) or '.', exist_ok=True)
-        pd.DataFrame(rows).to_csv(csv_path, index=False, encoding='utf-8-sig')
-        print(f"saved -> {csv_path}")
-    except Exception as e:
-        print(f"[warn] CSV 저장 실패: {e}")
-
-    png_path = f'test_results/shift_scenario{scenario}_W{J}_pareto.png'
+    # 시나리오별 CSV/PNG 는 더 이상 저장하지 않는다 — main() 이 모든 시나리오를 합쳐
+    # shift_combined 표(CSV) + 그림(PNG) 하나씩만 출력한다.
     pts_cat = {r: (np.concatenate(plot_pts[r][0]) if plot_pts[r][0] else np.array([]),
                    np.concatenate(plot_pts[r][1]) if plot_pts[r][1] else np.array([]))
                for r in ROWS}
@@ -634,12 +637,6 @@ def run_scenario(scenario, *, base_policy, device, args, paths_idx_list,
     plot_title = (f"Scenario {scenario} ({desc_en})  |  "
                   f"N={J}, M={machines_eff}, (Q{args.q_idx},P{args.p_idx}), "
                   f"yield={args.yield_mode}")
-    try:
-        plot_scenario_fronts(pts_cat, png_path, plot_title,
-                             cloud_frac=args.cloud_frac, cloud_seed=args.seed)
-        print(f"saved -> {png_path}")
-    except Exception as e:
-        print(f"[warn] Pareto 플롯 저장 실패: {e}")
     return rows, pts_cat, plot_title
 
 
@@ -778,15 +775,29 @@ def main():
         all_rows[scenario] = rows
         combined_items.append((pts_cat, f'Scenario {scenario}'))
 
-    if len(combined_items) >= 2:
-        combined_path = f'test_results/shift_combined_W{args.num_jobs}_pareto.png'
-        suptitle = 'Pareto Frontier under Distribution Shift'
-        try:
-            plot_combined_fronts(combined_items, combined_path, suptitle=suptitle,
-                                 cloud_frac=args.cloud_frac, cloud_seed=args.seed)
-            print(f"\nsaved -> {combined_path}  (3 시나리오 결합 플롯)")
-        except Exception as e:
-            print(f"[warn] 결합 Pareto 플롯 저장 실패: {e}")
+    # 결합 표(CSV) — 모든 시나리오 행을 Scenario 열을 붙여 하나로.
+    combined_csv = f'test_results/shift_combined_W{args.num_jobs}_table.csv'
+    try:
+        import pandas as pd
+        combined_rows = []
+        for scenario in scenarios:
+            for row in all_rows[scenario]:
+                combined_rows.append({'Scenario': scenario, **row})
+        os.makedirs(os.path.dirname(combined_csv) or '.', exist_ok=True)
+        pd.DataFrame(combined_rows).to_csv(combined_csv, index=False, encoding='utf-8-sig')
+        print(f"\nsaved -> {combined_csv}  (결합 표)")
+    except Exception as e:
+        print(f"[warn] 결합 CSV 저장 실패: {e}")
+
+    # 결합 그림(PNG) — 시나리오들을 가로로 나란히.
+    combined_path = f'test_results/shift_combined_W{args.num_jobs}_pareto.png'
+    suptitle = 'Pareto Frontier under Distribution Shift'
+    try:
+        plot_combined_fronts(combined_items, combined_path, suptitle=suptitle,
+                             cloud_frac=args.cloud_frac, cloud_seed=args.seed)
+        print(f"saved -> {combined_path}  ({len(combined_items)} 시나리오 결합 플롯)")
+    except Exception as e:
+        print(f"[warn] 결합 Pareto 플롯 저장 실패: {e}")
 
     print("\n=== done ===")
 
