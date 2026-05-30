@@ -286,7 +286,8 @@ def evaluate_one_path(*, env, model, env_edge_lookup_t, device,
                       wq_min, wq_max, num_lambdas, samples,
                       nsga_pop, nsga_gen,
                       iabc_pop, iabc_gen, iabc_limit, iabc_p_global, iabc_archive_cap,
-                      methods=None, on_baseline_done=None):
+                      methods=None, on_baseline_done=None,
+                      ours_s_chunks=1):
     """단일 path 인스턴스에 대해 method -> (ms_array, yld_array, time_s) dict 반환.
 
     methods 로 실행할 방법만 골라 돌린다(None 이면 전체 METHODS). 예: ['Ours (g)',
@@ -387,16 +388,41 @@ def evaluate_one_path(*, env, model, env_edge_lookup_t, device,
         outputs['Ours (g)'] = (ms, yld, t)
 
     # ── Ours (sampling) — λ-sweep × samples, stochastic ──
+    # ours_s_chunks > 1 이면 (num_lambdas·samples) 단일 배치를 n등분해 순차 실행 → peak VRAM ↓.
+    # 같은 인스턴스에서 큰 배치가 메모리 압박으로 오히려 느려질 때 유효(8×↑ 배치에 8×↑ 시간).
+    # manual_seed 는 청크 루프 *진입 전 1회* — 청크 간 RNG 가 연속이라 한 번에 돌릴 때와
+    # trajectory 자체는 다르지만 λ 별 sample 통계 품질은 동일.
     if 'Ours (s)' in methods:
-        def _run_sample():
-            torch.manual_seed(seed)                # 샘플링 재현성 (방법 실행 순서 무관)
-            return _run_single_experiment(
-                model, env, env_edge_lookup_t, device, qh, scorer,
-                problems_INT_list, wq_1, lam_s, num_lambdas * samples, 1, seed, False,
-                method='model')
+        total_sz = num_lambdas * samples
+        n_chunks = max(1, int(ours_s_chunks))
+        chunk_sizes = [total_sz // n_chunks + (1 if i < total_sz % n_chunks else 0)
+                       for i in range(n_chunks)]
 
-        (ms, yld), t = timed(_run_sample, device)
-        outputs['Ours (s)'] = (ms, yld, t)
+        torch.manual_seed(seed)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t_start = time.time()
+        ms_parts, yld_parts = [], []
+        cursor = 0
+        for ci, sz in enumerate(chunk_sizes):
+            lam_chunk = lam_s[cursor:cursor + sz]
+            cursor += sz
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t_c0 = time.time()
+            ms_c, yld_c = _run_single_experiment(
+                model, env, env_edge_lookup_t, device, qh, scorer,
+                problems_INT_list, wq_1, lam_chunk, sz, 1, seed, False,
+                method='model')
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            print(f"    Ours (s) chunk {ci+1}/{n_chunks}  |bp|={sz}  "
+                  f"t={time.time() - t_c0:.2f}s")
+            ms_parts.append(ms_c)
+            yld_parts.append(yld_c)
+        ms = np.concatenate(ms_parts)
+        yld = np.concatenate(yld_parts)
+        outputs['Ours (s)'] = (ms, yld, time.time() - t_start)
 
     return outputs, anchors
 
@@ -509,7 +535,11 @@ def main():
     p.add_argument('--paths_idx', type=str, default='1',
                    help="historical_paths 인덱스. '1' / '1~10' / '1,3,5'. 여러 개면 path 평균.")
     p.add_argument('--num_lambdas', type=int, default=32, help="Ours 의 λ grid 크기.")
-    p.add_argument('--samples', type=int, default=64, help="Ours (s) 의 λ 당 sample 수.")
+    p.add_argument('--samples', type=int, default=16, help="Ours (s) 의 λ 당 sample 수.")
+    p.add_argument('--ours_s_chunks', type=int, default=1,
+                   help="Ours (s) 의 (num_lambdas·samples) 배치를 몇 개로 나눠 순차 실행할지. "
+                        "기본 1(=분할 없음). GPU peak VRAM 압박으로 큰 배치가 느려질 때 늘리면 "
+                        "오히려 빨라질 수 있음. 매 청크 wall-clock 이 stdout 에 찍힘.")
     p.add_argument('--nsga_pop', type=int, default=100)
     p.add_argument('--nsga_gen', type=int, default=100)
     p.add_argument('--iabc_pop', type=int, default=0,
@@ -644,7 +674,8 @@ def main():
             nsga_pop=args.nsga_pop, nsga_gen=args.nsga_gen,
             iabc_pop=iabc_pop, iabc_gen=iabc_gen, iabc_limit=args.iabc_limit,
             iabc_p_global=args.iabc_p_global, iabc_archive_cap=args.iabc_archive_cap,
-            methods=run_methods, on_baseline_done=_save_baseline)
+            methods=run_methods, on_baseline_done=_save_baseline,
+            ours_s_chunks=args.ours_s_chunks)
 
         # only_model: 캐시된 baseline 점을 이 path 에 대해 로드해 비교군으로 병합.
         for name in loaded_baselines:

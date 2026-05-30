@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import torch
 
 import train_ASIL
@@ -142,7 +143,6 @@ def patch_eval_helper(eval_helper, log_path: str,
                그대로 보임. hvn 은 같은 (ms, quality) 로 계산된 정규화 HV.
     """
     orig = train_ASIL.eval_pareto
-    epoch_counter = [0]
     meta_written = [False]
     num_stages = len(machine_cnt_list)
 
@@ -153,7 +153,11 @@ def patch_eval_helper(eval_helper, log_path: str,
     def patched(*args, **kwargs):
         kwargs['quality_helper'] = eval_helper
         ms_lam, q_lam, hv, nd, hv_norm = orig(*args, **kwargs)
-        epoch_counter[0] += 1
+
+        # 실제 epoch 번호는 train_ASIL.train() 의 for-loop 변수 `epoch` 에서 끌어온다.
+        # eval_pareto 시그니처에 epoch 인자가 없어서 caller frame inspect 가 가장 깔끔.
+        caller = sys._getframe(1)
+        actual_epoch = caller.f_locals.get('epoch', -1)
 
         with open(log_path, 'a') as f:
             if not meta_written[0]:
@@ -169,7 +173,7 @@ def patch_eval_helper(eval_helper, log_path: str,
                 meta_written[0] = True
 
             record = {
-                'epoch':    epoch_counter[0],
+                'epoch':    int(actual_epoch),
                 'makespan': ms_lam.detach().cpu().tolist(),     # (L,K)
                 'quality':  q_lam.detach().cpu().tolist(),      # (L,K) — GT(=qh_eval) 산출
                 'hvn':      hv_norm.detach().cpu().tolist(),    # (K,)  — 정규화 HV per-instance

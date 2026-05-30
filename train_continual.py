@@ -7,12 +7,18 @@ train_continual.py — 웨이퍼 *지속학습(continual)* 이어학습 스크�
   1) warm-start   : --init_ckpt 의 가중치로 모델을 초기화(이어학습). 없으면 fresh init(=scratch).
   2) 품질 예측기   : 보상(compute_yield)·피처(compute_machine_quality) 예측기를 타깃 Q 로 교체.
   3) 작업시간 분포 : --time_low/--time_high 로 proc_time 샘플 범위 교체 (P3=넓게, P1=좁게).
-  4) 매-에폭 평가  : 매 에폭 끝 hook 으로 학습 target 에서 즉시 eval → 점 (ms, yld, t) 를
-                    train_results/continual_<row>_W{J}_Q{q}P{p}.jsonl 에 적재.
+  4) eval/ckpt    : train_ASIL.train() 내부 eval_pareto (매 eval_interval) 결과를 그대로 재활용.
+                    post_eval_hook 으로 점 (ms_lam, q_lam, t) 를
+                    train_results/continual_<slug>_W{J}_Q{q}P{p}.jsonl 에 한 줄 append.
                     파일은 이 런 시작 시 truncate → 한 파일 = 한 런 결과. meta 안 만듦.
-                    ckpt 는 매 eval_interval(기본 20 epoch) 마다 같은 경로
-                    train_results/continual_<slug>_W{J}_Q{q}P{p}.pt 로 *덮어쓰기* 저장
+                    ckpt 는 train() 본체가 매 eval_interval 마다 같은 경로
+                    checkpoints/continual_<slug>_W{J}_Q{q}P{p}.pt 로 *덮어쓰기* 저장
                     (= 최신 모델 1개만 유지). best 가중치 추적 안 함.
+                    eval_pareto 의 reward Q = quality_helper 그대로 = 타깃 Q,
+                    feature Q = CompositeQuality 라우팅 = 학습 조건과 동일.
+                    eval proc_time 은 eval_env 가 torch.randint[time_low, time_high) seed=0
+                    으로 매 호출 동일 인스턴스 샘플 (P_*.csv 고정 인스턴스는 안 씀 —
+                    학습 분포와 자연스럽게 일치).
 
 ⚠ 이 레포의 학습은 proc_time 을 *랜덤 샘플*(torch.randint[low, high), high 배타적) 로 만든다.
    P1/P2/P3 CSV 는 eval 전용 — 학습엔 안 쓰인다. 따라서 '(P1) 으로 이어학습' = proc 샘플 범위를
@@ -52,9 +58,7 @@ for _stream in (sys.stdout, sys.stderr):
 import numpy as np
 import torch
 
-from HFSPWrapper import QualityHelper, make_env_edge_lookup
-from HFSPGraphEnv import HFSPGraphEnv
-from quality_augment import GroundTruthQuality, load_proc_time_augmented
+from HFSPWrapper import QualityHelper
 import train_ASIL
 from train_ASIL import train
 
@@ -63,46 +67,53 @@ from train_ASIL import train
 # (train_ablation.py 와 동일 패턴.)
 train_ASIL.plot_pareto = lambda *_a, **_k: None
 
-# eval 시 필요한 두 헬퍼만 가져옴 — cache 채널은 train_results/ 로 분리됨.
-from experiment_continual import (
-    MaskedQuality as _EvalMaskedQuality,
-    model_front,
-)
-from experiment_table import timed
-
-
-# Eval target 의 (q_idx, paths_idx, p_idx) 는 args 에서 받아 학습 target 과 1:1 매치.
-_EVAL_NUM_LAMBDAS = 32
-_EVAL_SAMPLES = 64
-_EVAL_SEED = 0
-_EVAL_YIELD_MODE = 'raw'
-_EVAL_WQ_MIN = 0.99
-_EVAL_WQ_MAX = 1.00
-
 
 # 이 런 결과를 적재할 jsonl 의 row→slug 매핑. experiment_continual 의 _SWEEP_SLUG 와
 # 동일한 값이어야 후속 학습곡선 스크립트가 같은 파일을 찾는다.
 _ROW_SLUG = {'scratch': 'scratch', 'full-adapt': 'fulladapt',
              'stale-feat': 'stalefeat', 'masked-feat': 'maskedfeat'}
-_TRAIN_RESULTS_DIR = 'train_results'
-
 
 def _train_jsonl_path(slug: str, J: int, q_idx: int, p_idx: int) -> str:
-    return os.path.join(_TRAIN_RESULTS_DIR,
+    return os.path.join('train_results',
                         f'continual_{slug}_W{J}_Q{q_idx}P{p_idx}.jsonl')
 
 
 def _train_ckpt_path(slug: str, J: int, q_idx: int, p_idx: int) -> str:
-    return os.path.join(_TRAIN_RESULTS_DIR,
+    return os.path.join('checkpoints',
                         f'continual_{slug}_W{J}_Q{q_idx}P{p_idx}.pt')
 
 
+def _to_np(x) -> np.ndarray:
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu()
+    return np.asarray(x, dtype=np.float32)
+
+
 def _append_eval_record(path: str, paths_idx: int, slug: str, epoch: int,
-                        ms, yld, t: float) -> None:
-    rec = {'path': int(paths_idx), 'slug': str(slug), 'epoch': int(epoch),
-           'ms': np.asarray(ms, dtype=np.float32).ravel().tolist(),
-           'yld': np.asarray(yld, dtype=np.float32).ravel().tolist(),
-           't': float(t)}
+                        ms_lam, q_lam, hv, hv_norm, nd, t: float) -> None:
+    """eval_pareto 결과 한 줄 적재. ms/yld 는 (L, K) ravel 한 raw 점 (학습곡선 후처리용),
+    나머지는 학습곡선 즉시 플롯용 집계값. ms_lam[0]=λ=0 행, q_lam[-1]=λ=1 행.
+    """
+    ms_np = _to_np(ms_lam)
+    q_np  = _to_np(q_lam)
+    hv_np = _to_np(hv)
+    hvn_np = _to_np(hv_norm)
+    nd_np = _to_np(nd)
+    rec = {
+        'path': int(paths_idx), 'slug': str(slug), 'epoch': int(epoch),
+        'ms':  ms_np.ravel().tolist(),
+        'yld': q_np.ravel().tolist(),
+        'hv_mean':       float(hv_np.mean()),
+        'hv_std':        float(hv_np.std()),
+        'hv_norm_mean':  float(hvn_np.mean()),
+        'hv_norm_std':   float(hvn_np.std()),
+        'nd_mean':       float(nd_np.mean()),
+        'ep_ms':         float(ms_np[0].mean()),    # λ=0 endpoint mean makespan
+        'ep_q':          float(q_np[-1].mean()),    # λ=1 endpoint mean yield
+        'd_ms':          float(ms_np[-1].mean() - ms_np[0].mean()),
+        'd_q':           float(q_np[-1].mean() - q_np[0].mean()),
+        't': float(t),
+    }
     with open(path, 'a', encoding='utf-8') as f:
         f.write(json.dumps(rec, ensure_ascii=False) + '\n')
 
@@ -168,66 +179,32 @@ def _resolve_row_slug(init_ckpt: str, feat_mode: str) -> tuple[str, str]:
     return row, _ROW_SLUG[row]
 
 
-def _make_eval_hook(args, machines, num_stages, device):
-    """매 epoch 모델을 학습 target (args.q_idx, args.paths_idx, args.p_idx) 에서 평가 →
+def _make_post_eval_hook(args):
+    """train_ASIL.train() 내부 eval_pareto 결과를
     train_results/continual_<slug>_W{J}_Q{q}P{p}.jsonl 에 한 줄 append.
 
-    한 파일 = 한 런 결과: 런 시작 시 truncate 후 매 epoch 한 줄씩 append.
-    meta 안 만듦. ckpt 는 train() 본체가 매 eval_interval 마다 덮어씀(여기선 무관).
+    한 파일 = 한 런 결과: 런 시작 시 truncate 후 매 eval epoch 한 줄씩 append.
+    meta 안 만듦. ckpt 는 train() 본체가 매 eval_interval 마다 같은 경로 덮어씀(여기선 무관).
+    eval_pareto 가 quality_helper 를 그대로 받아 reward Q = 타깃 Q, feature Q = 학습 조건과
+    동일 (CompositeQuality 라우팅).
     """
     row, slug = _resolve_row_slug(args.init_ckpt, args.feat_mode)
-    q_idx, paths_idx, p_idx = args.q_idx, args.paths_idx, args.p_idx
-
-    # ── 평가 인스턴스 (학습 target 과 동일) 한 번만 셋업 ──
-    tgt_csv = f'quality_data/Q_{q_idx}/historical_paths_{paths_idx}.csv'
-    gq_tgt = GroundTruthQuality(num_stages=num_stages, device=device, csv_path=tgt_csv,
-                                machine_cnt_list=list(machines),
-                                wafer_quality_min=_EVAL_WQ_MIN, wafer_quality_max=_EVAL_WQ_MAX)
-    feat_helpers = {'target': gq_tgt, 'masked': _EvalMaskedQuality(args.mask_value)}
-    if args.feat_mode == 'stale':
-        src_csv = f'quality_data/Q_{args.src_q_idx}/historical_paths_{args.src_paths_idx}.csv'
-        feat_helpers['stale'] = GroundTruthQuality(
-            num_stages=num_stages, device=device, csv_path=src_csv,
-            machine_cnt_list=list(machines),
-            wafer_quality_min=_EVAL_WQ_MIN, wafer_quality_max=_EVAL_WQ_MAX)
-
-    env = HFSPGraphEnv(num_jobs=args.num_jobs, machine_cnt_list=list(machines), device=device)
-    env_edge_lookup_t = make_env_edge_lookup(env).to(device)
-    proc = load_proc_time_augmented(f'quality_data/P_{p_idx}.csv',
-                                    args.num_jobs, list(machines))
-    wq_1 = gq_tgt.sample_wafer_quality(B=1, num_jobs=args.num_jobs,
-                                        seed=_EVAL_SEED, device=device)
-
-    # eval 시 정책이 보는 피처 = 학습 조건과 동일
-    eval_feat_key = ('target' if args.feat_mode == 'full' else
-                     'stale' if args.feat_mode == 'stale' else 'masked')
-    qh = feat_helpers[eval_feat_key]
-
-    # 런 시작 시 jsonl truncate — 한 파일 = 한 런 결과. (옛 점들이 남아 있으면 무효 → 폐기.)
-    jsonl_path = _train_jsonl_path(slug, args.num_jobs, q_idx, p_idx)
+    paths_idx = args.paths_idx
+    jsonl_path = _train_jsonl_path(slug, args.num_jobs, args.q_idx, args.p_idx)
     os.makedirs(os.path.dirname(jsonl_path) or '.', exist_ok=True)
     open(jsonl_path, 'w', encoding='utf-8').close()
 
+    instances_per_lambda = args.eval_batch_size // args.pareto_lambdas
     print(f"[continual-eval-hook] row={row}, slug={slug}  -> "
-          f"(Q{q_idx}, P{p_idx}) paths_{paths_idx}  "
-          f"λ×{_EVAL_NUM_LAMBDAS}, s={_EVAL_SAMPLES}, seed={_EVAL_SEED}, "
-          f"feat={eval_feat_key}")
+          f"(Q{args.q_idx}, P{args.p_idx}) paths_{paths_idx}  "
+          f"eval_pareto λ×{args.pareto_lambdas}, "
+          f"batch={args.eval_batch_size} (={instances_per_lambda} instances/λ, greedy)")
     print(f"[continual-eval-hook] 점 적재 -> {jsonl_path}  (런 시작 시 truncate)")
 
-    def _hook(epoch, model):
-        was_training = model.training
-        model.eval()
+    def _hook(epoch, ms_lam, q_lam, hv, hv_norm, nd, eval_elapsed):
         try:
-            with torch.no_grad():
-                (ms, yld), t = timed(lambda: model_front(
-                    model, env, env_edge_lookup_t, device, qh, gq_tgt, proc, wq_1,
-                    _EVAL_NUM_LAMBDAS, _EVAL_SAMPLES, _EVAL_SEED, _EVAL_YIELD_MODE), device)
-        finally:
-            if was_training:
-                model.train()
-
-        try:
-            _append_eval_record(jsonl_path, paths_idx, slug, epoch, ms, yld, t)
+            _append_eval_record(jsonl_path, paths_idx, slug, epoch,
+                                ms_lam, q_lam, hv, hv_norm, nd, eval_elapsed)
         except Exception as e:
             print(f"[warn] jsonl append 실패 (epoch={epoch}): {e}")
 
@@ -253,7 +230,7 @@ def main():
         description="웨이퍼 지속학습 이어학습 (train_ASIL.train 재사용). "
                     "타깃 기본 Q1, 작업시간 {3,4,5,6}. 매 에폭 eval → jsonl 캐시 적재.")
     # warm-start.
-    p.add_argument('--init_ckpt', type=str, default='',
+    p.add_argument('--init_ckpt', type=str, default='checkpoints/0523_baseline.pt',
                    help="이어학습 시작 ckpt (소스 (P3,Q3) 정책). 비우면 fresh init(=scratch).")
     # 인스턴스 구조.
     p.add_argument('--num_jobs', type=int, default=25)
@@ -291,8 +268,8 @@ def main():
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--seed', type=int, default=1)
     # 평가/저장.
-    p.add_argument('--eval_interval', type=int, default=20)
-    p.add_argument('--eval_batch_size', type=int, default=320,
+    p.add_argument('--eval_interval', type=int, default=1)
+    p.add_argument('--eval_batch_size', type=int, default=32*10,
                    help="Pareto eval 총 인스턴스 수. --pareto_lambdas 로 나눠떨어져야 함.")
     p.add_argument('--pareto_lambdas', type=int, default=32)
     # reward 정규화 anchor (train_ASIL __main__ 기본값과 동일).
@@ -339,8 +316,8 @@ def main():
     print(f"[continual] epochs={args.epochs}  ckpt -> {ckpt_path} "
           f"(매 {args.eval_interval} epoch 덮어씌움)")
 
-    # 매 epoch 끝에 eval → continual_points_W{J}_Q{q}P{p}.jsonl 에 직접 적재.
-    eval_hook = _make_eval_hook(args, machines, num_stages, device)
+    # 매 eval_interval epoch 마다 eval_pareto 결과 → jsonl 한 줄 append.
+    eval_hook = _make_post_eval_hook(args)
 
     train(
         num_epochs=args.epochs,
@@ -367,7 +344,7 @@ def main():
         # ── continual 전용 주입 ──
         init_ckpt=args.init_ckpt or None,
         quality_helper=quality_helper,
-        post_epoch_hook=eval_hook,       # 매 에폭 eval → jsonl 캐시 적재
+        post_eval_hook=eval_hook,        # 매 eval_interval eval_pareto → jsonl 캐시 적재
     )
     print("\n=== continual training done ===")
 

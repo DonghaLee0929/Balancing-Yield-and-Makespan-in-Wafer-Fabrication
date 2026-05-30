@@ -157,8 +157,9 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
           # ── 아래는 train_continual.py 용 선택 인자 (모두 default = 기존 동작 그대로) ──
           init_ckpt=None,          # 주어지면 그 ckpt 가중치로 warm-start (이어학습). 없으면 fresh init.
           quality_helper=None,     # 주어지면 그대로 사용(피처/보상 예측기 주입). 없으면 Q_3/paths_1 로드.
-          post_epoch_hook=None,    # 주어지면 매 에폭 끝에 hook(epoch, model) 호출.
-                                   # train_continual.py 가 매 epoch 직접 eval → jsonl 캐시 적재용.
+          post_eval_hook=None,     # 주어지면 eval_pareto 직후
+                                   # hook(epoch, ms_lam, q_lam, hv, hv_norm, nd, t) 호출.
+                                   # train_continual.py 가 매 eval epoch 점/집계값을 jsonl 적재용.
           ):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.manual_seed(seed)
@@ -355,13 +356,6 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
         optimizer.step()
         scheduler.step()
 
-        # ── (옵션) 매 에폭 끝 hook — 매 에폭 직접 eval → 캐시 적재 등 ──
-        if post_epoch_hook is not None:
-            try:
-                post_epoch_hook(epoch, model)
-            except Exception as e:
-                print(f"[warn] post_epoch_hook 실패 (epoch={epoch}): {e}")
-
         loss_mean = torch.stack(loss_buf).mean().item()
         avg_ms = torch.stack(ms_avg_buf).mean().item()
         best_ms = torch.stack(ms_best_buf).mean().item()
@@ -446,6 +440,13 @@ def train(num_epochs, n_accum, batch_size, pomo_size,
             total_eval_time += eval_elapsed
             log_msg += f" ({eval_elapsed:5.2f}s)"
             print(log_msg)
+
+            # ── (옵션) eval_pareto 직후 hook — 학습곡선 jsonl 적재 등 ──
+            if post_eval_hook is not None:
+                try:
+                    post_eval_hook(epoch, ms_lam, q_lam, hv, hv_norm, nd, eval_elapsed)
+                except Exception as e:
+                    print(f"[warn] post_eval_hook 실패 (epoch={epoch}): {e}")
 
         # Reward 정규화 anchor — 현재 고정값이라 flat line. ms/mean·q/mean 수렴을
         # m_min/m_max·q_min/q_max 경계와 같은 차트에서 비교하기 위한 reference.
