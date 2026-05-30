@@ -55,7 +55,13 @@ import torch
 from HFSPWrapper import QualityHelper, make_env_edge_lookup
 from HFSPGraphEnv import HFSPGraphEnv
 from quality_augment import GroundTruthQuality, load_proc_time_augmented
+import train_ASIL
 from train_ASIL import train
+
+# 매 epoch eval 마다 pareto_epoch_*.png 가 train_results/ 에 쌓이는 걸 막음.
+# rec.log_pareto 는 wandb_enabled=False 면 어차피 early-return 이라 PNG 경로 안 씀.
+# (train_ablation.py 와 동일 패턴.)
+train_ASIL.plot_pareto = lambda *_a, **_k: None
 
 # eval 시 필요한 두 헬퍼만 가져옴 — cache 채널은 train_results/ 로 분리됨.
 from experiment_continual import (

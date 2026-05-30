@@ -208,8 +208,7 @@ def main():
     p.add_argument('--n_accum', type=int, default=1)
     p.add_argument('--batch_size', type=int, default=50)
     p.add_argument('--pomo_size', type=int, default=64)
-    p.add_argument('--eval_interval', type=int, default=1,
-                   help='Ablation: 매 epoch HVN(paths_1 GT) 곡선용. 기본 학습은 20.')
+    p.add_argument('--eval_interval', type=int, default=20)
     p.add_argument('--eval_batch_size', type=int, default=32 * 10)
     p.add_argument('--pareto_lambdas', type=int, default=32)
     # NOTE: reward anchor / HVN anchor / HV_REF / PLOT 은 모두 파일 상단 상수에서 설정.
@@ -245,10 +244,6 @@ def main():
     # 매 epoch eval 이라 PNG scatter 가 400 개 쌓이는 걸 막기 위해 plot_pareto 를 no-op 로.
     # rec.log_pareto 는 wandb_enabled=False 면 어차피 early-return 이라 PNG 경로 안 씀.
     train_ASIL.plot_pareto = lambda *_a, **_k: None
-    # 모델 ckpt 저장도 비활성화 — ablation 이라 모델 보관 불필요 (디스크/시간 낭비).
-    # train_ASIL.train() 안의 torch.save({...}, ckpt_path) 호출이 no-op 으로 처리됨.
-    # 스크립트는 train 종료 후 바로 끝나므로 글로벌 패치라도 부수 효과 없음.
-    torch.save = lambda *_a, **_k: None
 
     train_ASIL.train(
         num_epochs=args.epochs,
